@@ -1,0 +1,7 @@
+name = Task Manager Notifications
+description = تنبيهات داخل الموقع عند إضافة تعليق أو تحديث مهمة.
+package = Task Management
+version = 1.x-1.0.0
+backdrop = 1.x
+type = module
+dependencies[] = task_manager

@@ -1,0 +1,38 @@
+<?php
+/**
+ * @file
+ * دوال التثبيت وإلغاء التثبيت لوحدة Task Manager.
+ */
+/**
+ * Implements hook_install().
+ */
+function task_manager_install() {
+  // تهيئة ملف التكوين.
+  $config = config('task_manager.settings');
+  $config->set('task_manager_mode', '');
+  $config->set('task_manager_bundle', '');
+  $config->set('task_manager_bundles', array());
+  $config->save();
+
+  // ملاحظة: يُنشأ View إدارة المهام من صفحة الإعدادات بعد إنشاء الحقول.
+
+  // رسالة إرشادية للمستخدم.
+  backdrop_set_message(t('تم تثبيت وحدة Task Manager. يرجى زيارة <a href="@url">صفحة الإعدادات</a> لتكوين نوع المحتوى.', array(
+    '@url' => url('admin/config/content/task-manager'),
+  )));
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function task_manager_uninstall() {
+  // حذف ملف التكوين بالكامل.
+  config('task_manager.settings')->delete();
+
+  // حذف View إدارة المهام.
+  config('views.view.task_management')->delete();
+
+  backdrop_set_message(t('تم إلغاء تثبيت وحدة Task Manager. لم يتم حذف الحقول أو أنواع المحتوى تلقائيًا للحفاظ على البيانات.'));
+}
+
+

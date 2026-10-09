@@ -1,0 +1,15 @@
+name = Task Manager
+description = وحدة إدارة المهام مع دعم الحقول المتعددة للصور والملفات، مصممة لدعم وحدات فرعية للتنبيهات والبريد والواتساب.
+package = Task Management
+version = 1.x-1.0.0
+backdrop = 1.x
+type = module
+
+configure = admin/config/content/task-manager
+
+dependencies[] = field
+dependencies[] = image
+dependencies[] = date
+dependencies[] = file
+dependencies[] = comment
+dependencies[] = options

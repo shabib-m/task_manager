@@ -1,0 +1,133 @@
+/**
+ * @file
+ * أنماط عرض التنبيهات.
+ */
+
+.task-notification {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  margin-bottom: 10px;
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.task-notification:hover {
+  background: #f8f9fa;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
+}
+
+/* غير مقروء */
+.task-notification.is-unread {
+  background: #e3f2fd;
+  border-color: #90caf9;
+  border-right: 4px solid #1976d2;
+}
+
+/* مقروء */
+.task-notification.is-read {
+  opacity: 0.75;
+}
+
+/* أيقونة */
+.task-notification-icon {
+  flex-shrink: 0;
+  font-size: 1.4em;
+  line-height: 1;
+  padding-top: 2px;
+}
+
+.task-notification-icon .icon-unread {
+  color: #1976d2;
+}
+
+.task-notification-icon .icon-read {
+  color: #4caf50;
+}
+
+/* المحتوى */
+.task-notification-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.task-notification-title {
+  font-size: 1em;
+  font-weight: 600;
+  margin-bottom: 6px;
+  line-height: 1.4;
+}
+
+.task-notification-title a {
+  color: #1a1a1a;
+  text-decoration: none;
+}
+
+.task-notification-title a:hover {
+  color: #1976d2;
+  text-decoration: underline;
+}
+
+/* البيانات الوصفية */
+.task-notification-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 0.85em;
+  color: #666;
+}
+
+.task-notification-date {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* شارة "جديد" */
+.task-notification-badge {
+  background: #1976d2;
+  color: #fff;
+  font-size: 0.7em;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-weight: 500;
+  margin-right: auto;
+}
+
+/* ============================================
+   تجاوزات RTL
+   ============================================ */
+
+[dir="rtl"] .task-notification {
+  direction: rtl;
+  text-align: right;
+}
+
+[dir="rtl"] .task-notification.is-unread {
+  border-right: 1px solid #90caf9;
+  border-left: 4px solid #1976d2;
+}
+
+[dir="rtl"] .task-notification-badge {
+  margin-right: 0;
+  margin-left: auto;
+}
+
+/* ============================================
+   استجابة للشاشات الصغيرة
+   ============================================ */
+
+@media (max-width: 600px) {
+  .task-notification {
+    padding: 10px 12px;
+  }
+  .task-notification-title {
+    font-size: 0.95em;
+  }
+  .task-notification-meta {
+    font-size: 0.8em;
+  }
+}

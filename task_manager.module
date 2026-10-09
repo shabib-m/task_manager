@@ -1,0 +1,2362 @@
+<?php
+/**
+ * @file
+ * الوحدة الرئيسية لإدارة المهام.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function task_manager_menu() {
+  $items = array();
+
+  $items['admin/config/content/task-manager'] = array(
+    'title' => 'إعدادات إدارة المهام',
+    'description' => 'تكوين نوع المحتوى وربط الحقول.',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => array('task_manager_settings_form'),
+    'access arguments' => array('administer task manager'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function task_manager_permission() {
+  return array(
+    'administer task manager' => array(
+      'title' => t('إدارة إعدادات Task Manager'),
+      'description' => t('الوصول إلى صفحة إعدادات وحدة إدارة المهام.'),
+      'restrict access' => TRUE,
+      'warning' => t('يسمح بإنشاء حقول وأنواع محتوى وتفعيل التعليقات على أنواع المحتوى.'),
+    ),
+    'access task management' => array(
+      'title' => t('الوصول إلى صفحة إدارة المهام'),
+      'description' => t('عرض قائمة المهام في المسار admin/content/tasks.'),
+    ),
+    'change task status' => array(
+      'title' => t('تغيير حالة المهمة من التعليقات'),
+      'description' => t('السماح بتغيير حالة المهمة عند إضافة تعليق مع اختيار حالة جديدة.'),
+    ),
+  );
+}
+
+/* ============================================================
+ *  دوال مساعدة عامة
+ * ============================================================ */
+
+/**
+ * يُرجع قائمة أنواع المحتوى المرتبطة بالوحدة.
+ *
+ * تُخزَّن النتيجة في backdrop_static() لتفادي قراءة CMI في كل مرة.
+ * استخدم backdrop_static_reset('task_manager_get_bundles') لإعادة التعيين
+ * بعد تحديث الإعدادات.
+ *
+ * @return array
+ *   مصفوفة بأسماء أنواع المحتوى المرتبطة.
+ */
+function task_manager_get_bundles() {
+  $bundles = &backdrop_static(__FUNCTION__);
+  if (!isset($bundles)) {
+    $bundles = config_get('task_manager.settings', 'task_manager_bundles');
+    if (!is_array($bundles)) {
+      $bundles = array();
+    }
+  }
+  return $bundles;
+}
+
+/**
+ * يتحقق هل التعليق تابع لنوع محتوى مرتبط بالوحدة.
+ *
+ * @param object $comment
+ *   كائن التعليق.
+ *
+ * @return bool
+ */
+function task_manager_is_task_comment($comment) {
+  $bundles = task_manager_get_bundles();
+  if (empty($bundles)) {
+    return FALSE;
+  }
+
+  $type = !empty($comment->node_type) ? $comment->node_type : '';
+  if (strpos($type, 'comment_node_') === 0) {
+    $type = substr($type, strlen('comment_node_'));
+  }
+  if ($type === '' && !empty($comment->nid)) {
+    $node = node_load($comment->nid);
+    $type = $node ? $node->type : '';
+  }
+
+  return $type !== '' && in_array($type, $bundles);
+}
+
+/**
+ * يعيد القيم المسموحة لحالة المهمة (المفاتيح فقط).
+ *
+ * @return array
+ */
+function task_manager_allowed_statuses() {
+  $allowed = array('new', 'in_progress', 'completed', 'closed');
+  $field = field_info_field('field_task_status');
+  if ($field && !empty($field['settings']['allowed_values']) && is_array($field['settings']['allowed_values'])) {
+    $allowed = array_map('strval', array_keys($field['settings']['allowed_values']));
+  }
+  return array_values(array_filter($allowed, 'strlen'));
+}
+
+/**
+ * يعيد مخطط التخزين المناسب لملفات المهام.
+ *
+ * يفضّل التخزين الخاص. عند عدم توفره يستخدم التخزين العام إذا كان متاحًا،
+ * ويعرض تحذيرًا للمسؤول بأن الملفات قد تكون متاحة لمن يعرف روابطها.
+ *
+ * @return string|false
+ *   'private' أو 'public' أو FALSE.
+ */
+function task_manager_file_scheme() {
+  static $scheme = NULL;
+  static $resolved = FALSE;
+
+  if ($resolved) {
+    return $scheme;
+  }
+
+  $resolved = TRUE;
+  if (file_stream_wrapper_get_class('private')) {
+    $scheme = 'private';
+  }
+  elseif (file_stream_wrapper_get_class('public')) {
+    $scheme = 'public';
+    backdrop_set_message(t('لم يتم ضبط مسار الملفات الخاصة (file_private_path في settings.php). ستُحفظ حقول الصور والملفات في التخزين العام public:// لإكمال الإعداد، وقد يتمكن أي شخص يعرف رابط الملف من الوصول إليه. تقع مسؤولية ضبط صلاحيات الملفات على صاحب الموقع. اضبط المسار الخاص ثم أعد حفظ الإعدادات لاستخدام التخزين الخاص.'), 'warning');
+  }
+  else {
+    $scheme = FALSE;
+    backdrop_set_message(t('لم يتوفر مخطط تخزين خاص أو عام للملفات. تعذر إنشاء حقول الصور والملفات؛ اضبط file_private_path أو تحقق من تفعيل مخطط public:// ثم أعد حفظ الإعدادات.'), 'warning');
+  }
+
+  return $scheme;
+}
+
+/**
+ * يعيد أسماء حقول المرفقات التي تخزّن ملفاتها في public://.
+ *
+ * @return array
+ */
+function task_manager_public_file_fields() {
+  $result = array();
+  foreach (array('field_task_images', 'field_task_files', 'comment_task_images', 'comment_task_files') as $name) {
+    $field = field_info_field($name);
+    if ($field && isset($field['settings']['uri_scheme']) && $field['settings']['uri_scheme'] === 'public') {
+      $result[] = $name;
+    }
+  }
+  return $result;
+}
+
+/**
+ * إعدادات instance الآمنة لحقول الصور (امتدادات وحجم ودقة قصوى).
+ *
+ * @return array
+ */
+function task_manager_image_instance_settings() {
+  return array(
+    'file_extensions' => 'png gif jpg jpeg',
+    'max_filesize' => '10 MB',
+    'max_resolution' => '4000x4000',
+  );
+}
+
+/**
+ * إعدادات instance الآمنة لحقول الملفات (امتدادات وحجم أقصى).
+ *
+ * @return array
+ */
+function task_manager_file_instance_settings() {
+  return array(
+    'file_extensions' => 'txt pdf doc docx xls xlsx ppt pptx csv zip jpg jpeg png gif',
+    'max_filesize' => '10 MB',
+  );
+}
+
+/* ============================================================
+ *  نموذج الإعدادات (Settings Form)
+ * ============================================================ */
+
+/**
+ * نموذج الإعدادات الرئيسي.
+ */
+/**
+ * نموذج إعدادات وحدة إدارة المهام.
+ */
+function task_manager_settings_form($form, &$form_state) {
+  // جلب الإعدادات الحالية.
+  $current_mode = config_get('task_manager.settings', 'task_manager_mode');
+  $current_bundles = config_get('task_manager.settings', 'task_manager_bundles');
+  if (empty($current_bundles) || !is_array($current_bundles)) {
+    $current_bundles = array();
+  }
+
+  // قائمة أنواع المحتوى المتاحة (تُجلب مرة واحدة).
+  $content_type_names = node_type_get_names();
+
+  // قسم الأنواع المرتبطة حالياً.
+  if (!empty($current_bundles)) {
+    $form['linked_bundles'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('الأنواع المرتبطة حالياً'),
+      '#collapsible' => TRUE,
+      '#description' => t('يمكنك إلغاء تحديد أي نوع لإزالته من الوحدة. لن تُحذف الحقول أو المحتوى، لكن الوحدة لن تتعامل معه بعد الآن.'),
+    );
+
+    foreach ($current_bundles as $bundle) {
+      $label = isset($content_type_names[$bundle]) ? $content_type_names[$bundle] : $bundle;
+
+      $form['linked_bundles']['bundle_' . $bundle] = array(
+        '#type' => 'checkbox',
+        '#title' => t('@label (@bundle)', array('@label' => $label, '@bundle' => $bundle)),
+        '#default_value' => 1,
+      );
+    }
+
+    $form['linked_bundles']['help'] = array(
+      '#markup' => '<p class="description">' . t('ملاحظة: إلغاء التحديد يزيل النوع من قائمة الأنواع المرتبطة، لكنه لا يحذف الحقول أو المحتوى.') . '</p>',
+    );
+  }
+
+  // قسم صفحة المهام (Views).
+  $form['linked_views'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('صفحة المهام (Views)'),
+    '#collapsible' => TRUE,
+    '#description' => t('<p>صفحة عرض المهام: <a href="@url">admin/content/tasks</a>.</p>
+      <p>يمكنك تعديلها من: <a href="@views_url">إعدادات الـ View</a>.</p>', array(
+        '@url' => url('admin/content/tasks'),
+        '@views_url' => url('admin/structure/views/view/task_management'),
+      )),
+  );
+
+  $form['linked_views']['content'] = array(
+    '#theme' => 'item_list',
+    '#items' => array(
+      t('عند تفعيل نوع محتوى جديد، سيُضاف تلقائيًا إلى إعدادات المهام وإلى الـ View.'),
+      t('عند إلغاء تفعيل نوع محتوى، ستُزال إعداداته من صفحة المهام تلقائيًا.'),
+      t('كل ذلك يتم تلقائيًا دون تدخل يدوي.'),
+      t('عند إضافة ميزة جديدة، يُنصح بعمل نسخة من الـ View وإضافة تعديلاتك عليها.'),
+    ),
+  );
+
+  $form['intro'] = array(
+    '#markup' => '<p>' . t('اختر طريقة إعداد وحدة إدارة المهام. يمكنك إنشاء نوع محتوى جديد، أو ربط الوحدة بنوع محتوى موجود مسبقًا.') . '</p>',
+  );
+
+  // خيارات طريقة الإعداد.
+  $mode_options = array(
+    'new' => t('إنشاء نوع محتوى جديد (Task)'),
+    'existing' => t('ربط نوع محتوى موجود'),
+  );
+
+  if (!empty($current_bundles)) {
+    // يسمح بحفظ إزالة الأنواع دون إضافة أو ربط أي نوع.
+    $mode_options = array('none' => t('تحديث الأنواع المرتبطة فقط (دون إضافة نوع)')) + $mode_options;
+    $mode_default = 'none';
+  }
+  else {
+    $mode_default = !empty($current_mode) ? $current_mode : 'new';
+  }
+
+  $form['task_manager_mode'] = array(
+    '#type' => 'radios',
+    '#title' => t('طريقة الإعداد'),
+    '#options' => $mode_options,
+    '#default_value' => $mode_default,
+    '#required' => TRUE,
+  );
+
+  // قائمة أنواع المحتوى الموجودة.
+  $form['task_manager_bundle'] = array(
+    '#type' => 'select',
+    '#title' => t('اختر نوع المحتوى'),
+    '#description' => t('سيتم إضافة الحقول الناقصة (صور متعددة، ملفات متعددة) إلى هذا النوع.'),
+    '#options' => $content_type_names,
+    '#empty_option' => t('- اختر نوع المحتوى -'),
+    '#states' => array(
+      'visible' => array(
+        ':input[name="task_manager_mode"]' => array('value' => 'existing'),
+      ),
+      'required' => array(
+        ':input[name="task_manager_mode"]' => array('value' => 'existing'),
+      ),
+    ),
+  );
+
+  // معلومات توضيحية.
+  $form['info'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('ماذا سيحدث عند الحفظ؟'),
+    '#collapsible' => TRUE,
+    '#states' => array(
+      'visible' => array(
+        ':input[name="task_manager_mode"]' => array('value' => 'existing'),
+      ),
+    ),
+  );
+
+  $form['info']['content'] = array(
+    '#theme' => 'item_list',
+    '#items' => array(
+      t('سيتم فحص الحقول الموجودة في نوع المحتوى المختار.'),
+      t('إذا كان حقل النص الطويل موجودًا، لن يتم إنشاؤه مرة أخرى.'),
+      t('سيتم إضافة حقل الصور المتعدد إذا لم يكن موجودًا.'),
+      t('سيتم إضافة حقل الملفات المتعدد إذا لم يكن موجودًا.'),
+      t('سيتم إضافة حقول الصور والملفات إلى التعليقات.'),
+      t('سيتم إضافة النوع الجديد إلى قائمة الأنواع المرتبطة (دون إزالة الأنواع السابقة).'),
+    ),
+  );
+
+  $form['actions'] = array('#type' => 'actions');
+  $form['actions']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('حفظ الإعدادات'),
+  );
+
+  return $form;
+}
+
+/**
+ * التحقق من صحة النموذج.
+ */
+function task_manager_settings_form_validate($form, &$form_state) {
+  $mode = $form_state['values']['task_manager_mode'];
+  $bundle = !empty($form_state['values']['task_manager_bundle']) ? $form_state['values']['task_manager_bundle'] : '';
+
+  if ($mode == 'existing' && empty($bundle)) {
+    form_set_error('task_manager_bundle', t('يجب اختيار نوع محتوى عند اختيار "ربط نوع محتوى موجود".'));
+  }
+
+  if ($mode == 'new' && node_type_load('task')) {
+    backdrop_set_message(t('نوع المحتوى "Task" موجود مسبقًا. سيتم استخدامه بدلاً من إنشاء نوع جديد.'), 'warning');
+  }
+}
+
+/**
+ * معالجة إرسال النموذج.
+ */
+function task_manager_settings_form_submit($form, &$form_state) {
+  $mode = $form_state['values']['task_manager_mode'];
+  $bundle = !empty($form_state['values']['task_manager_bundle']) ? $form_state['values']['task_manager_bundle'] : '';
+
+  $config = config('task_manager.settings');
+  if ($mode !== 'none') {
+    $config->set('task_manager_mode', $mode);
+  }
+
+  // 1. معالجة الأنواع المرتبطة (الحذف).
+  $current_bundles = $config->get('task_manager_bundles');
+  if (empty($current_bundles) || !is_array($current_bundles)) {
+    $current_bundles = array();
+  }
+
+  $updated_bundles = array();
+  foreach ($current_bundles as $existing_bundle) {
+    if (!is_string($existing_bundle) || $existing_bundle === '') {
+      watchdog('task_manager', 'Ignoring invalid linked content type in task manager settings.', array(), WATCHDOG_WARNING);
+      continue;
+    }
+    $checkbox_key = 'bundle_' . $existing_bundle;
+    if (isset($form_state['values'][$checkbox_key]) && $form_state['values'][$checkbox_key]) {
+      if (!in_array($existing_bundle, $updated_bundles, TRUE)) {
+        $updated_bundles[] = $existing_bundle;
+      }
+    }
+    else {
+      backdrop_set_message(t('تم إزالة النوع "@bundle" من الأنواع المرتبطة.', array('@bundle' => $existing_bundle)));
+    }
+  }
+
+  // 2. إنشاء أو ربط نوع المحتوى، أو إعادة تهيئة الأنواع التي بقيت مرتبطة.
+  $new_bundle = '';
+  $bundle_errors = 0;
+  $bundles_reconfigured = 0;
+  if ($mode == 'new') {
+    if (!node_type_load('task')) {
+      task_manager_create_task_content_type();
+      backdrop_set_message(t('تم إنشاء نوع المحتوى "Task" بنجاح.'));
+      entity_info_cache_clear();
+      field_cache_clear();
+      node_type_cache_reset();
+    }
+    else {
+      backdrop_set_message(t('نوع المحتوى "Task" موجود مسبقًا، تم استخدامه.'));
+    }
+
+    task_manager_attach_fields('task');
+    $new_bundle = 'task';
+  }
+  elseif ($mode == 'existing') {
+    // تحقق من أن $bundle صالح.
+    if (empty($bundle) || !node_type_load($bundle)) {
+      backdrop_set_message(t('يجب اختيار نوع محتوى صالح.'), 'error');
+      return;
+    }
+
+    task_manager_attach_fields($bundle);
+    backdrop_set_message(t('تم ربط الوحدة بنوع المحتوى "@bundle" وإضافة الحقول الناقصة.', array('@bundle' => $bundle)));
+    $new_bundle = $bundle;
+  }
+  elseif ($mode == 'none') {
+    foreach ($updated_bundles as $existing_bundle) {
+      if (!node_type_load($existing_bundle)) {
+        watchdog('task_manager', 'Skipping missing linked content type @bundle during settings update.', array(
+          '@bundle' => $existing_bundle,
+        ), WATCHDOG_WARNING);
+        $bundle_errors++;
+        continue;
+      }
+
+      $comments_enabled = task_manager_ensure_comments_enabled($existing_bundle);
+      task_manager_attach_fields($existing_bundle, TRUE, $comments_enabled);
+      $bundles_reconfigured++;
+      if (!$comments_enabled) {
+        $bundle_errors++;
+      }
+    }
+  }
+
+  // 3. إضافة النوع الجديد إلى القائمة (إذا لم يكن موجوداً).
+  if (!empty($new_bundle) && !in_array($new_bundle, $updated_bundles)) {
+    $updated_bundles[] = $new_bundle;
+  }
+
+  // 4. حفظ القائمة المحدثة.
+  $config->set('task_manager_bundles', $updated_bundles);
+  $config->save();
+
+  if ($mode === 'none') {
+    if ($bundle_errors) {
+      backdrop_set_message(t('تم تحديث قائمة الأنواع المرتبطة، لكن تعذر تفعيل التعليقات أو التحقق منها على @count نوع/أنواع. راجع سجل النظام لمعرفة التفاصيل.', array(
+        '@count' => $bundle_errors,
+      )), 'warning');
+    }
+    elseif (!$bundles_reconfigured) {
+      backdrop_set_message(t('تم تحديث قائمة الأنواع المرتبطة. لم يتم اختيار أي نوع لإعادة تهيئته.'));
+    }
+    else {
+      backdrop_set_message(t('تم تحديث الأنواع المرتبطة وإعادة محاولة تهيئة التعليقات والحقول للأنواع المحددة.'));
+    }
+  }
+
+  // 5. إنشاء View ومزامنة فلتر الأنواع فيه مع الأنواع المرتبطة ثم مسح الكاش.
+  task_manager_create_view();
+  if (task_manager_sync_view_types()) {
+    backdrop_set_message(t('تم تحديث فلتر نوع المحتوى في صفحة المهام ليطابق الأنواع المرتبطة.'));
+  }
+  task_manager_clear_caches();
+
+  $form_state['redirect'] = 'admin/config/content/task-manager';
+}
+
+/* ============================================================
+ *  الدوال المساعدة (Helper Functions)
+ * ============================================================ */
+/**
+ * يتحقق مما إذا كان نوع المحتوى يحتوي على حقل نصي طويل.
+ *
+ * @param string $bundle
+ *   اسم نوع المحتوى.
+ * @param array|null $instances
+ *   (اختياري) مصفوفة الحقول المرفقة، لتجنب استدعاء field_info_instances مجددًا.
+ *
+ * @return bool
+ *   TRUE إذا وُجد حقل نصي طويل، FALSE خلاف ذلك.
+ */
+function task_manager_has_text_field($bundle, $instances = NULL) {
+  if (empty($bundle) || !is_string($bundle)) {
+    return FALSE;
+  }
+
+  if ($instances === NULL) {
+    $instances = field_info_instances('node', $bundle);
+  }
+
+  if (empty($instances) || !is_array($instances)) {
+    return FALSE;
+  }
+
+  foreach ($instances as $field_name => $instance) {
+    $field = field_info_field($field_name);
+
+    // تحقق من أن $field مصفوفة وأن 'type' نص.
+    if (!is_array($field) || empty($field['type']) || !is_string($field['type'])) {
+      continue;
+    }
+
+    if (in_array($field['type'], array('text_long', 'text_with_summary'), TRUE)) {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * يرفق حقول المهام بنوع محتوى معيّن.
+ *
+ * يتحقق أولاً من الصلاحيات وصحة المدخلات، ثم يضيف الحقول الناقصة فقط
+ * (حقل نصي طويل، صور متعددة، ملفات متعددة، حالة المهمة، تاريخ المهمة).
+ * كما يضيف حقل اسم الموظف إلى حساب المستخدم، ويفعّل التعليقات قبل إرفاق
+ * حقولها على النوع.
+ *
+ * @param string $bundle
+ *   اسم نوع المحتوى (مثل 'task' أو 'article'). يجب أن يكون نوعًا موجودًا.
+ * @param bool $include_body
+ *   هل نتحقق من وجود حقل نصي طويل ونضيفه إذا لم يوجد؟
+ * @param bool|null $comments_enabled
+ *   نتيجة تحقق سابقة من تفعيل التعليقات لتجنب تكرار التحقق في الطلب نفسه.
+ *
+ * @return array
+ *   مصفوفة بأسماء الحقول المُضافة. فارغة إذا لم يُضَف أي حقل.
+ */
+function task_manager_attach_fields($bundle, $include_body = TRUE, $comments_enabled = NULL) {
+  // معرفة المستخدم الحالي.
+  $uid = isset($GLOBALS['user']->uid) ? $GLOBALS['user']->uid : 0;
+
+  // 1. التحقق من الصلاحيات.
+  if (!user_access('administer task manager')) {
+    watchdog('task_manager', 'Unauthorized attempt to attach fields to @bundle by user @uid.', array(
+      '@bundle' => is_string($bundle) ? $bundle : gettype($bundle),
+      '@uid' => $uid,
+    ), WATCHDOG_WARNING);
+    return array();
+  }
+
+  // 2. التحقق من صحة $bundle.
+  if (empty($bundle) || !is_string($bundle)) {
+    watchdog('task_manager', 'Invalid bundle type: @type.', array(
+      '@type' => gettype($bundle),
+    ), WATCHDOG_WARNING);
+    return array();
+  }
+
+  // 3. التحقق من وجود نوع المحتوى.
+  if (!node_type_load($bundle)) {
+    watchdog('task_manager', 'Bundle does not exist: @bundle.', array(
+      '@bundle' => $bundle,
+    ), WATCHDOG_WARNING);
+    return array();
+  }
+
+  // 4. تطبيع $include_body.
+  $include_body = (bool) $include_body;
+
+  $added = array();
+
+  // 5. جلب الحقول الموجودة مسبقًا.
+  $existing_instances = field_info_instances('node', $bundle);
+  if (!is_array($existing_instances)) {
+    $existing_instances = array();
+  }
+  $existing_fields = array_keys($existing_instances);
+
+  // 6. حقل النص الطويل.
+  if ($include_body && !task_manager_has_text_field($bundle, $existing_instances)) {
+    try {
+      task_manager_create_text_field($bundle);
+      $added[] = 'field_task_description';
+    }
+    catch (Exception $e) {
+      watchdog('task_manager', 'Failed to create text field for @bundle: @message', array(
+        '@bundle' => $bundle,
+        '@message' => $e->getMessage(),
+      ), WATCHDOG_ERROR);
+    }
+  }
+
+  // 7. حقل الصور المتعدد.
+  if (!in_array('field_task_images', $existing_fields, TRUE)) {
+    try {
+      task_manager_create_image_field($bundle);
+      $added[] = 'field_task_images';
+    }
+    catch (Exception $e) {
+      watchdog('task_manager', 'Failed to create image field for @bundle: @message', array(
+        '@bundle' => $bundle,
+        '@message' => $e->getMessage(),
+      ), WATCHDOG_ERROR);
+    }
+  }
+
+  // 8. حقل الملفات المتعدد.
+  if (!in_array('field_task_files', $existing_fields, TRUE)) {
+    try {
+      task_manager_create_file_field($bundle);
+      $added[] = 'field_task_files';
+    }
+    catch (Exception $e) {
+      watchdog('task_manager', 'Failed to create file field for @bundle: @message', array(
+        '@bundle' => $bundle,
+        '@message' => $e->getMessage(),
+      ), WATCHDOG_ERROR);
+    }
+  }
+
+  // 9. حقل حالة المهمة.
+  if (!in_array('field_task_status', $existing_fields, TRUE)) {
+    try {
+      task_manager_create_status_field($bundle);
+      $added[] = 'field_task_status';
+    }
+    catch (Exception $e) {
+      watchdog('task_manager', 'Failed to create status field for @bundle: @message', array(
+        '@bundle' => $bundle,
+        '@message' => $e->getMessage(),
+      ), WATCHDOG_ERROR);
+    }
+  }
+
+  // 10. حقل تاريخ المهمة.
+  if (!in_array('field_task_date', $existing_fields, TRUE)) {
+    try {
+      task_manager_create_date_field($bundle);
+      $added[] = 'field_task_date';
+    }
+    catch (Exception $e) {
+      watchdog('task_manager', 'Failed to create date field for @bundle: @message', array(
+        '@bundle' => $bundle,
+        '@message' => $e->getMessage(),
+      ), WATCHDOG_ERROR);
+    }
+  }
+
+  // 11. حقول التعليقات.
+  if ($comments_enabled === NULL) {
+    $comments_enabled = task_manager_ensure_comments_enabled($bundle);
+  }
+  else {
+    $comments_enabled = (bool) $comments_enabled;
+  }
+
+  if ($comments_enabled) {
+    try {
+      task_manager_attach_comment_fields($bundle);
+      $added[] = 'comment_fields';
+    }
+    catch (Exception $e) {
+      watchdog('task_manager', 'Failed to attach comment fields for @bundle: @message', array(
+        '@bundle' => $bundle,
+        '@message' => $e->getMessage(),
+      ), WATCHDOG_ERROR);
+    }
+  }
+  else {
+    watchdog('task_manager', 'Comments not enabled for @bundle; skipping comment fields.', array(
+      '@bundle' => $bundle,
+    ), WATCHDOG_WARNING);
+  }
+
+  // 12. تسجيل العملية.
+  if (!empty($added)) {
+    watchdog('task_manager', 'Fields attached to @bundle by user @uid: @fields.', array(
+      '@bundle' => $bundle,
+      '@uid' => $uid,
+      '@fields' => implode(', ', $added),
+    ), WATCHDOG_INFO);
+  }
+
+  return $added;
+}
+
+/**
+ * إنشاء حقل النص الطويل.
+ */
+function task_manager_create_text_field($bundle) {
+  $field = array(
+    'field_name' => 'field_task_description',
+    'type' => 'text_long',
+    'cardinality' => 1,
+    'locked' => FALSE,
+    'translatable' => TRUE,
+  );
+
+  if (!field_read_field('field_task_description')) {
+    field_create_field($field);
+  }
+
+  $instance = array(
+    'field_name' => 'field_task_description',
+    'entity_type' => 'node',
+    'bundle' => $bundle,
+    'label' => t('وصف المهمة'),
+    'required' => FALSE,
+    'widget' => array(
+      'type' => 'text_textarea',
+      'settings' => array('rows' => 10),
+    ),
+    'display' => array(
+      'default' => array('type' => 'text_default'),
+      'teaser' => array('type' => 'text_summary_or_trimmed'),
+    ),
+  );
+
+  if (!field_read_instance('node', 'field_task_description', $bundle)) {
+    field_create_instance($instance);
+  }
+}
+
+/**
+ * يُنشئ حقل الصور المتعدد ويربطه بنوع محتوى معيّن.
+ *
+ * يتحقق أولًا من الصلاحيات وصحة المدخلات، ثم ينشئ الحقل إذا لم يكن موجودًا，
+ * وينشئ المثيل (instance) على النوع إذا لم يكن موجودًا.
+ *
+ * @param string $bundle
+ *   اسم نوع المحتوى (مثل 'task' أو 'article'). يجب أن يكون نوعًا موجودًا.
+ *
+ * @return void
+ */
+function task_manager_create_image_field($bundle) {
+  // معرفة المستخدم الحالي (آمن في سياقات CLI).
+  $uid = isset($GLOBALS['user']->uid) ? $GLOBALS['user']->uid : 0;
+
+  // 1. التحقق من الصلاحيات.
+  if (!user_access('administer task manager')) {
+    watchdog('task_manager', 'Unauthorized attempt to create image field for @bundle by user @uid.', array(
+      '@bundle' => is_string($bundle) ? $bundle : gettype($bundle),
+      '@uid' => $uid,
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 2. التحقق من صحة $bundle.
+  if (empty($bundle) || !is_string($bundle)) {
+    watchdog('task_manager', 'Invalid bundle type for image field: @type.', array(
+      '@type' => gettype($bundle),
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 3. التحقق من وجود نوع المحتوى.
+  if (!node_type_load($bundle)) {
+    watchdog('task_manager', 'Bundle does not exist: @bundle.', array(
+      '@bundle' => $bundle,
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 4. إذا كان المثيل موجودًا، فلا حاجة لفعل شيء.
+  if (field_read_instance('node', 'field_task_images', $bundle) !== FALSE) {
+    return;
+  }
+
+  // 5. إنشاء الحقل إذا لم يكن موجودًا.
+  if (field_read_field('field_task_images') === FALSE) {
+    $scheme = task_manager_file_scheme();
+    if (!$scheme) {
+      watchdog('task_manager', 'No valid file scheme available for image field.', array(), WATCHDOG_WARNING);
+      return;
+    }
+
+    try {
+      field_create_field(array(
+        'field_name' => 'field_task_images',
+        'type' => 'image',
+        'cardinality' => FIELD_CARDINALITY_UNLIMITED,
+        'locked' => FALSE,
+        'settings' => array('uri_scheme' => $scheme),
+      ));
+    }
+    catch (Exception $e) {
+      watchdog('task_manager', 'Failed to create image field: @message', array(
+        '@message' => $e->getMessage(),
+      ), WATCHDOG_ERROR);
+      return;
+    }
+  }
+
+  // 6. تجهيز إعدادات المثيل.
+  $settings = task_manager_image_instance_settings();
+  if (!is_array($settings)) {
+    $settings = array();
+  }
+
+  // 7. إنشاء المثيل.
+  $instance = array(
+    'field_name' => 'field_task_images',
+    'entity_type' => 'node',
+    'bundle' => $bundle,
+    'label' => t('صور المهمة'),
+    'required' => FALSE,
+    'settings' => $settings,
+    'widget' => array('type' => 'image_image'),
+    'display' => array(
+      'default' => array(
+        'type' => 'image',
+        'settings' => array('image_style' => 'medium', 'image_link' => 'content'),
+      ),
+      'teaser' => array(
+        'type' => 'image',
+        'settings' => array('image_style' => 'thumbnail', 'image_link' => 'content'),
+      ),
+    ),
+  );
+
+  try {
+    field_create_instance($instance);
+  }
+  catch (Exception $e) {
+    watchdog('task_manager', 'Failed to create image instance for @bundle: @message', array(
+      '@bundle' => $bundle,
+      '@message' => $e->getMessage(),
+    ), WATCHDOG_ERROR);
+    return;
+  }
+
+  // 8. تسجيل النجاح.
+  watchdog('task_manager', 'Image field attached to @bundle by user @uid.', array(
+    '@bundle' => $bundle,
+    '@uid' => $uid,
+  ), WATCHDOG_INFO);
+}
+
+/**
+ * يُنشئ حقل الملفات المتعدد ويربطه بنوع محتوى معيّن.
+ *
+ * يتحقق أولًا من الصلاحيات وصحة المدخلات، ثم ينشئ الحقل إذا لم يكن موجودًا，
+ * وينشئ المثيل (instance) على النوع إذا لم يكن موجودًا.
+ *
+ * @param string $bundle
+ *   اسم نوع المحتوى (مثل 'task' أو 'article'). يجب أن يكون نوعًا موجودًا.
+ *
+ * @return void
+ */
+function task_manager_create_file_field($bundle) {
+  // معرفة المستخدم الحالي (آمن في سياقات CLI).
+  $uid = isset($GLOBALS['user']->uid) ? $GLOBALS['user']->uid : 0;
+
+  // 1. التحقق من الصلاحيات.
+  if (!user_access('administer task manager')) {
+    watchdog('task_manager', 'Unauthorized attempt to create file field for @bundle by user @uid.', array(
+      '@bundle' => is_string($bundle) ? $bundle : gettype($bundle),
+      '@uid' => $uid,
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 2. التحقق من صحة $bundle.
+  if (empty($bundle) || !is_string($bundle)) {
+    watchdog('task_manager', 'Invalid bundle type for file field: @type.', array(
+      '@type' => gettype($bundle),
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 3. التحقق من وجود نوع المحتوى.
+  if (!node_type_load($bundle)) {
+    watchdog('task_manager', 'Bundle does not exist: @bundle.', array(
+      '@bundle' => $bundle,
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 4. التحقق من تفعيل وحدة file (مطلوبة لحقل file).
+  if (!module_exists('file')) {
+    watchdog('task_manager', 'File module is not enabled; cannot create file field for @bundle.', array(
+      '@bundle' => $bundle,
+    ), WATCHDOG_ERROR);
+    return;
+  }
+
+  // 5. إذا كان المثيل موجودًا، فلا حاجة لفعل شيء.
+  if (field_read_instance('node', 'field_task_files', $bundle) !== FALSE) {
+    return;
+  }
+
+  // 6. إنشاء الحقل إذا لم يكن موجودًا.
+  if (field_read_field('field_task_files') === FALSE) {
+    $scheme = task_manager_file_scheme();
+    if (!$scheme) {
+      watchdog('task_manager', 'No valid file scheme available for file field.', array(), WATCHDOG_WARNING);
+      return;
+    }
+
+    try {
+      field_create_field(array(
+        'field_name' => 'field_task_files',
+        'type' => 'file',
+        'cardinality' => FIELD_CARDINALITY_UNLIMITED,
+        'locked' => FALSE,
+        'settings' => array('uri_scheme' => $scheme),
+      ));
+    }
+    catch (Exception $e) {
+      watchdog('task_manager', 'Failed to create file field: @message', array(
+        '@message' => $e->getMessage(),
+      ), WATCHDOG_ERROR);
+      return;
+    }
+  }
+
+  // 7. تجهيز إعدادات المثيل.
+  $settings = task_manager_file_instance_settings();
+  if (!is_array($settings)) {
+    $settings = array();
+  }
+
+  // 8. إنشاء المثيل.
+  $instance = array(
+    'field_name' => 'field_task_files',
+    'entity_type' => 'node',
+    'bundle' => $bundle,
+    'label' => t('ملفات المهمة'),
+    'required' => FALSE,
+    'settings' => $settings,
+    'widget' => array(
+      'type' => 'file_generic',
+      'settings' => array('progress_indicator' => 'throbber'),
+    ),
+    'display' => array(
+      'default' => array('type' => 'file_default'),
+    ),
+  );
+
+  try {
+    field_create_instance($instance);
+  }
+  catch (Exception $e) {
+    watchdog('task_manager', 'Failed to create file instance for @bundle: @message', array(
+      '@bundle' => $bundle,
+      '@message' => $e->getMessage(),
+    ), WATCHDOG_ERROR);
+    return;
+  }
+
+  // 9. تسجيل النجاح.
+  watchdog('task_manager', 'File field attached to @bundle by user @uid.', array(
+    '@bundle' => $bundle,
+    '@uid' => $uid,
+  ), WATCHDOG_INFO);
+}
+
+/**
+ * يُنشئ حقل حالة المهمة ويربطه بنوع محتوى معيّن.
+ *
+ * يتحقق أولًا من الصلاحيات وصحة المدخلات، ثم ينشئ الحقل إذا لم يكن موجودًا،
+ * وينشئ المثيل (instance) على النوع إذا لم يكن موجودًا.
+ *
+ * ملاحظة: قيم allowed_values تُخزَّن كمفاتيح ثابتة (بالإنجليزية)،
+ * والترجمة تتم في طبقة العرض لتجنب تخزين نصوص مترجمة في قاعدة البيانات.
+ *
+ * @param string $bundle
+ *   اسم نوع المحتوى (مثل 'task' أو 'article'). يجب أن يكون نوعًا موجودًا.
+ *
+ * @return void
+ */
+function task_manager_create_status_field($bundle) {
+  // معرفة المستخدم الحالي (آمن في سياقات CLI).
+  $uid = isset($GLOBALS['user']->uid) ? $GLOBALS['user']->uid : 0;
+
+  // 1. التحقق من الصلاحيات.
+  if (!user_access('administer task manager')) {
+    watchdog('task_manager', 'Unauthorized attempt to create status field for @bundle by user @uid.', array(
+      '@bundle' => is_string($bundle) ? $bundle : gettype($bundle),
+      '@uid' => $uid,
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 2. التحقق من صحة $bundle.
+  if (empty($bundle) || !is_string($bundle)) {
+    watchdog('task_manager', 'Invalid bundle type for status field: @type.', array(
+      '@type' => gettype($bundle),
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 3. التحقق من وجود نوع المحتوى.
+  if (!node_type_load($bundle)) {
+    watchdog('task_manager', 'Bundle does not exist: @bundle.', array(
+      '@bundle' => $bundle,
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 4. إذا كان المثيل موجودًا، فلا حاجة لفعل شيء.
+  if (field_read_instance('node', 'field_task_status', $bundle) !== FALSE) {
+    return;
+  }
+
+  // 5. إنشاء الحقل إذا لم يكن موجودًا.
+  if (field_read_field('field_task_status') === FALSE) {
+    $field = array(
+      'field_name' => 'field_task_status',
+      'type' => 'list_text',
+      'cardinality' => 1,
+      'locked' => FALSE,
+      'translatable' => TRUE,
+      'settings' => array(
+        // قيم ثابتة (مفاتيح) تُخزَّن في قاعدة البيانات.
+        // الترجمة تتم في طبقة العرض عبر task_manager_status_labels().
+        'allowed_values' => array(
+          'new' => 'New',
+          'in_progress' => 'In progress',
+          'completed' => 'Completed',
+          'closed' => 'Closed',
+        ),
+      ),
+    );
+
+    try {
+      field_create_field($field);
+    }
+    catch (Exception $e) {
+      watchdog('task_manager', 'Failed to create status field: @message', array(
+        '@message' => $e->getMessage(),
+      ), WATCHDOG_ERROR);
+      return;
+    }
+  }
+
+  // 6. إنشاء المثيل.
+  $instance = array(
+    'field_name' => 'field_task_status',
+    'entity_type' => 'node',
+    'bundle' => $bundle,
+    'label' => t('حالة المهمة'),
+    'required' => TRUE,
+    'default_value' => array(array('value' => 'new')),
+    'widget' => array(
+      'type' => 'options_select',
+    ),
+    'display' => array(
+      'default' => array('type' => 'hidden'),
+      'teaser' => array('type' => 'hidden'),
+    ),
+  );
+
+  try {
+    field_create_instance($instance);
+  }
+  catch (Exception $e) {
+    watchdog('task_manager', 'Failed to create status instance for @bundle: @message', array(
+      '@bundle' => $bundle,
+      '@message' => $e->getMessage(),
+    ), WATCHDOG_ERROR);
+    return;
+  }
+
+  // 7. تسجيل النجاح.
+  watchdog('task_manager', 'Status field attached to @bundle by user @uid.', array(
+    '@bundle' => $bundle,
+    '@uid' => $uid,
+  ), WATCHDOG_INFO);
+}
+
+/**
+ * يُنشئ حقل تاريخ المهمة ويربطه بنوع محتوى معيّن.
+ *
+ * يتحقق أولًا من الصلاحيات وصحة المدخلات، ثم ينشئ الحقل إذا لم يكن موجودًا，
+ * وينشئ المثيل (instance) على النوع إذا لم يكن موجودًا.
+ *
+ * ملاحظة: الحقل يعرض تاريخًا ووقتًا بدقة دقيقة. إذا كنت تحتاج تاريخًا فقط،
+ * عدّل granularity و datetime_type.
+ *
+ * @param string $bundle
+ *   اسم نوع المحتوى (مثل 'task' أو 'article'). يجب أن يكون نوعًا موجودًا.
+ *
+ * @return void
+ */
+function task_manager_create_date_field($bundle) {
+  // معرفة المستخدم الحالي (آمن في سياقات CLI).
+  $uid = isset($GLOBALS['user']->uid) ? $GLOBALS['user']->uid : 0;
+
+  // 1. التحقق من الصلاحيات.
+  if (!user_access('administer task manager')) {
+    watchdog('task_manager', 'Unauthorized attempt to create date field for @bundle by user @uid.', array(
+      '@bundle' => is_string($bundle) ? $bundle : gettype($bundle),
+      '@uid' => $uid,
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 2. التحقق من صحة $bundle.
+  if (empty($bundle) || !is_string($bundle)) {
+    watchdog('task_manager', 'Invalid bundle type for date field: @type.', array(
+      '@type' => gettype($bundle),
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 3. التحقق من وجود نوع المحتوى.
+  if (!node_type_load($bundle)) {
+    watchdog('task_manager', 'Bundle does not exist: @bundle.', array(
+      '@bundle' => $bundle,
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 4. إذا كان المثيل موجودًا، فلا حاجة لفعل شيء.
+  if (field_read_instance('node', 'field_task_date', $bundle) !== FALSE) {
+    return;
+  }
+
+  // 5. إنشاء الحقل إذا لم يكن موجودًا.
+  if (field_read_field('field_task_date') === FALSE) {
+    $field = array(
+      'field_name' => 'field_task_date',
+      'type' => 'datetime',
+      'cardinality' => 1,
+      'locked' => FALSE,
+      'translatable' => TRUE,
+      'settings' => array(
+        'granularity' => array(
+          'year' => 'year',
+          'month' => 'month',
+          'day' => 'day',
+          'hour' => 'hour',
+          'minute' => 'minute',
+        ),
+        'timezone_db' => 'UTC',
+        'tz_handling' => 'site',
+        'datetime_type' => 'datetime',
+      ),
+    );
+
+    try {
+      field_create_field($field);
+    }
+    catch (Exception $e) {
+      watchdog('task_manager', 'Failed to create date field: @message', array(
+        '@message' => $e->getMessage(),
+      ), WATCHDOG_ERROR);
+      return;
+    }
+  }
+
+  // 6. إنشاء المثيل.
+  $instance = array(
+    'field_name' => 'field_task_date',
+    'entity_type' => 'node',
+    'bundle' => $bundle,
+    'label' => t('تاريخ المهمة'),
+    'required' => FALSE,
+    'widget' => array(
+      'type' => 'datetime',
+      'settings' => array(
+        'increment' => 15,
+        'date_order' => 'YMD',
+        'time_type' => '24',
+      ),
+    ),
+    'display' => array(
+      'default' => array(
+        'type' => 'hidden',
+      ),
+      'teaser' => array(
+        'type' => 'hidden',
+      ),
+    ),
+  );
+
+  try {
+    field_create_instance($instance);
+  }
+  catch (Exception $e) {
+    watchdog('task_manager', 'Failed to create date instance for @bundle: @message', array(
+      '@bundle' => $bundle,
+      '@message' => $e->getMessage(),
+    ), WATCHDOG_ERROR);
+    return;
+  }
+
+  // 7. تسجيل النجاح.
+  watchdog('task_manager', 'Date field attached to @bundle by user @uid.', array(
+    '@bundle' => $bundle,
+    '@uid' => $uid,
+  ), WATCHDOG_INFO);
+}
+
+/**
+ * يرفق حقول التعليقات (صور، ملفات، حالة) بحزمة التعليقات المرتبطة بنوع محتوى.
+ *
+ * يتحقق أولًا من الصلاحيات وصحة المدخلات، ثم ينشئ الحقول الناقصة فقط.
+ *
+ * ملاحظة: قيم allowed_values تُخزَّن كمفاتيح إنجليزية ثابتة،
+ * والترجمة تتم في طبقة العرض عبر task_manager_comment_status_labels().
+ *
+ * @param string $bundle
+ *   اسم نوع المحتوى (مثل 'task' أو 'article'). يجب أن يكون نوعًا موجودًا.
+ *
+ * @return void
+ */
+function task_manager_attach_comment_fields($bundle) {
+      watchdog('task_manager', 'task_manager_attach_comment_fields called for @bundle.', array('@bundle' => $bundle), WATCHDOG_DEBUG);
+      
+  // معرفة المستخدم الحالي (آمن في سياقات CLI).
+  $uid = isset($GLOBALS['user']->uid) ? $GLOBALS['user']->uid : 0;
+
+  // 1. التحقق من الصلاحيات.
+  if (!user_access('administer task manager')) {
+    watchdog('task_manager', 'Unauthorized attempt to attach comment fields for @bundle by user @uid.', array(
+      '@bundle' => is_string($bundle) ? $bundle : gettype($bundle),
+      '@uid' => $uid,
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 2. التحقق من صحة $bundle.
+  if (empty($bundle) || !is_string($bundle)) {
+    watchdog('task_manager', 'Invalid bundle type for comment fields: @type.', array(
+      '@type' => gettype($bundle),
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 3. التحقق من وجود نوع المحتوى.
+  if (!node_type_load($bundle)) {
+    watchdog('task_manager', 'Bundle does not exist: @bundle.', array(
+      '@bundle' => $bundle,
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 4. التحقق من أن التعليقات مفعلة على النوع.
+  $node_type = node_type_load($bundle);
+  if (!module_exists('comment') || !$node_type || empty($node_type->settings['comment_enabled'])) {
+    watchdog('task_manager', 'Comments are not enabled for @bundle.', array(
+      '@bundle' => $bundle,
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 5. التأكد من وجود حزمة التعليقات.
+  $comment_bundle = task_manager_ensure_comment_bundle($bundle);
+  if (!$comment_bundle) {
+    watchdog('task_manager', 'Failed to ensure comment bundle for @bundle.', array(
+      '@bundle' => $bundle,
+    ), WATCHDOG_ERROR);
+    backdrop_set_message(t('لم يتمكن من إنشاء حزمة التعليقات لنوع المحتوى "@bundle".', array('@bundle' => $bundle)), 'error');
+    return;
+  }
+
+  // 6. جلب الحقول الموجودة في حزمة التعليقات.
+  $existing_instances = field_info_instances('comment', $comment_bundle);
+  if (!is_array($existing_instances)) {
+    $existing_instances = array();
+  }
+  $existing_fields = array_keys($existing_instances);
+
+  // 7. حساب مخطط التخزين مرة واحدة وعند الحاجة فقط. غياب مخطط آمن
+  //    يمنع إضافة حقول الصور والملفات فقط، لا حقل حالة التعليق.
+  $need_images = !in_array('comment_task_images', $existing_fields, TRUE);
+  $need_files = !in_array('comment_task_files', $existing_fields, TRUE);
+  $scheme = NULL;
+  if ($need_images || $need_files) {
+    $scheme = task_manager_file_scheme();
+    if (!$scheme) {
+      watchdog('task_manager', 'No valid file scheme available for comment fields.', array(), WATCHDOG_WARNING);
+    }
+  }
+
+  // 8. حقل الصور للتعليقات.
+  if ($need_images && $scheme && field_read_instance('comment', 'comment_task_images', $comment_bundle) === FALSE) {
+    try {
+      if (field_read_field('comment_task_images') === FALSE) {
+        field_create_field(array(
+          'field_name' => 'comment_task_images',
+          'type' => 'image',
+          'cardinality' => FIELD_CARDINALITY_UNLIMITED,
+          'locked' => FALSE,
+          'settings' => array('uri_scheme' => $scheme),
+        ));
+      }
+
+      $image_settings = task_manager_image_instance_settings();
+      if (!is_array($image_settings)) {
+        $image_settings = array();
+      }
+
+      field_create_instance(array(
+        'field_name' => 'comment_task_images',
+        'entity_type' => 'comment',
+        'bundle' => $comment_bundle,
+        'label' => t('صور التعليق'),
+        'required' => FALSE,
+        'settings' => $image_settings,
+        'widget' => array('type' => 'image_image'),
+        'display' => array(
+          'default' => array(
+            'type' => 'image',
+            'settings' => array('image_style' => 'thumbnail', 'image_link' => 'content'),
+          ),
+        ),
+      ));
+    }
+    catch (Exception $e) {
+      watchdog('task_manager', 'Failed to create comment image field: @message', array(
+        '@message' => $e->getMessage(),
+      ), WATCHDOG_ERROR);
+    }
+  }
+
+  // 9. حقل الملفات للتعليقات.
+  if ($need_files && $scheme && field_read_instance('comment', 'comment_task_files', $comment_bundle) === FALSE) {
+    try {
+      if (field_read_field('comment_task_files') === FALSE) {
+        field_create_field(array(
+          'field_name' => 'comment_task_files',
+          'type' => 'file',
+          'cardinality' => FIELD_CARDINALITY_UNLIMITED,
+          'locked' => FALSE,
+          'settings' => array('uri_scheme' => $scheme),
+        ));
+      }
+
+      $file_settings = task_manager_file_instance_settings();
+      if (!is_array($file_settings)) {
+        $file_settings = array();
+      }
+
+      field_create_instance(array(
+        'field_name' => 'comment_task_files',
+        'entity_type' => 'comment',
+        'bundle' => $comment_bundle,
+        'label' => t('ملفات التعليق'),
+        'required' => FALSE,
+        'settings' => $file_settings,
+        'widget' => array('type' => 'file_generic'),
+        'display' => array('default' => array('type' => 'file_default')),
+      ));
+    }
+    catch (Exception $e) {
+      watchdog('task_manager', 'Failed to create comment file field: @message', array(
+        '@message' => $e->getMessage(),
+      ), WATCHDOG_ERROR);
+    }
+  }
+
+  // 10. حقل حالة المهمة في التعليق.
+  if (!in_array('field_comment_status', $existing_fields, TRUE) && field_read_instance('comment', 'field_comment_status', $comment_bundle) === FALSE) {
+    try {
+      if (field_read_field('field_comment_status') === FALSE) {
+        field_create_field(array(
+          'field_name' => 'field_comment_status',
+          'type' => 'list_text',
+          'cardinality' => 1,
+          'locked' => FALSE,
+          'translatable' => TRUE,
+          'settings' => array(
+            // مفاتيح ثابتة (إنجليزية) تُخزَّن في قاعدة البيانات.
+            // الترجمة تتم في طبقة العرض عبر task_manager_comment_status_labels().
+            'allowed_values' => array(
+              '' => '- No change -',
+              'new' => 'New',
+              'in_progress' => 'In progress',
+              'completed' => 'Completed',
+              'closed' => 'Closed',
+            ),
+          ),
+        ));
+      }
+
+      field_create_instance(array(
+        'field_name' => 'field_comment_status',
+        'entity_type' => 'comment',
+        'bundle' => $comment_bundle,
+        'label' => t('تحديث حالة المهمة'),
+        'description' => t('اختر الحالة الجديدة للمهمة عند حفظ هذا التعليق.'),
+        'required' => FALSE,
+        'default_value' => array(array('value' => '')),
+        'widget' => array(
+          'type' => 'options_select',
+        ),
+        'display' => array(
+          'default' => array(
+            'type' => 'hidden',
+          ),
+        ),
+      ));
+    }
+    catch (Exception $e) {
+      watchdog('task_manager', 'Failed to create comment status field: @message', array(
+        '@message' => $e->getMessage(),
+      ), WATCHDOG_ERROR);
+    }
+  }
+
+  // 11. مسح كاش الحقول (تكفي وحدها).
+  field_cache_clear();
+
+  // 12. تسجيل النجاح.
+  watchdog('task_manager', 'Comment fields attached to @bundle by user @uid.', array(
+    '@bundle' => $bundle,
+    '@uid' => $uid,
+  ), WATCHDOG_INFO);
+}
+
+/**
+ * يُنشئ نوع محتوى "مهمة" (Task).
+ *
+ * يتحقق أولًا من الصلاحيات، ثم من وجود النوع مسبقًا، وينشئه فقط إذا لم يكن موجودًا.
+ * يتم تفعيل التعليقات بعد الإنشاء بواسطة task_manager_ensure_comments_enabled().
+ *
+ * ملاحظة: تُخزَّن المفاتيح الثابتة (بالإنجليزية) في قاعدة البيانات،
+ * والترجمة تتم في طبقة العرض عبر hook_node_type_load().
+ *
+ * @return void
+ */
+function task_manager_create_task_content_type() {
+  // معرفة المستخدم الحالي (آمن في سياقات CLI).
+  $uid = isset($GLOBALS['user']->uid) ? $GLOBALS['user']->uid : 0;
+
+  // 1. التحقق من الصلاحيات.
+  if (!user_access('administer task manager')) {
+    watchdog('task_manager', 'Unauthorized attempt to create task content type by user @uid.', array(
+      '@uid' => $uid,
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 2. التحقق من وجود النوع مسبقًا.
+  if (node_type_load('task')) {
+    watchdog('task_manager', 'Content type "task" already exists; skipping creation.', array(
+      '@uid' => $uid,
+    ), WATCHDOG_INFO);
+    return;
+  }
+
+  // 3. تجهيز تعريف النوع (مفاتيح ثابتة إنجليزية).
+  $type = array(
+    'type' => 'task',
+    'name' => 'Task',
+    'base' => 'node_content',
+    'description' => 'Content type for tasks with multiple images and files support.',
+    'help' => '',
+    'has_title' => TRUE,
+    'title_label' => 'Task title',
+    'custom' => TRUE,
+    'modified' => TRUE,
+    'locked' => FALSE,
+  );
+
+  // 4. إنشاء النوع.
+  try {
+    node_type_save((object) $type);
+  }
+  catch (Exception $e) {
+    watchdog('task_manager', 'Failed to create task content type: @message', array(
+      '@message' => $e->getMessage(),
+    ), WATCHDOG_ERROR);
+    return;
+  }
+
+  // 5. تسجيل النجاح.
+  watchdog('task_manager', 'Task content type created by user @uid.', array(
+    '@uid' => $uid,
+  ), WATCHDOG_INFO);
+}
+
+/**
+ * يُنشئ View إدارة المهام إذا لم يكن موجودًا.
+ *
+ * لا يتحقق من وجود الحقول المطلوبة (هذه مسؤولية دالة منفصلة).
+ * الـ View يُنشأ دائمًا، والحقول تُضاف إليه ديناميكيًا عند عرضه.
+ *
+ * @return bool
+ *   TRUE إذا تم الإنشاء أو كان موجودًا، FALSE عند الفشل.
+ */
+function task_manager_create_view() {
+  // 1. التحقق من تفعيل وحدة Views.
+  if (!module_exists('views')) {
+    watchdog('task_manager', 'Views module is not enabled; cannot create task view.', array(), WATCHDOG_WARNING);
+    backdrop_set_message(t('وحدة Views غير مفعلة، لم يتم إنشاء View إدارة المهام.'), 'warning');
+    return FALSE;
+  }
+
+  // 2. لا نستبدل View موجودًا.
+  $config = config('views.view.task_management');
+  if ($config->get('name') !== NULL) {
+    return TRUE;
+  }
+
+  // 3. تحميل ملف تعريف الـ View.
+  $loaded = module_load_include('inc', 'task_manager', 'task_manager_views');
+  if ($loaded === FALSE) {
+    watchdog('task_manager', 'Failed to load task_manager_views.inc.', array(), WATCHDOG_ERROR);
+    backdrop_set_message(t('فشل تحميل ملف تعريف الـ View.'), 'error');
+    return FALSE;
+  }
+
+  // 4. جلب بيانات الـ View.
+  $data = task_manager_view_definition();
+  if (!is_array($data)) {
+    watchdog('task_manager', 'task_manager_view_definition() returned invalid data.', array(), WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  // 5. تحديث إصدار Backdrop.
+  if (defined('BACKDROP_VERSION')) {
+    $data['core'] = BACKDROP_VERSION;
+  }
+
+  // 6. حفظ الـ View.
+  try {
+    $config->setData($data);
+    $config->save();
+  }
+  catch (Exception $e) {
+    watchdog('task_manager', 'Failed to create task view: @message', array(
+      '@message' => $e->getMessage(),
+    ), WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  // 7. مسح كاش الـ Views.
+  if (function_exists('views_invalidate_cache')) {
+    views_invalidate_cache();
+  }
+
+  // 8. تسجيل النجاح.
+  watchdog('task_manager', 'Task view created successfully.', array(), WATCHDOG_INFO);
+  backdrop_set_message(t('تم إنشاء View إدارة المهام على المسار <a href="@url">admin/content/tasks</a>.', array(
+    '@url' => url('admin/content/tasks'),
+  )));
+
+  return TRUE;
+}
+
+/**
+ * يزامن فلتر "نوع المحتوى" في View إدارة المهام مع الأنواع المرتبطة بالوحدة.
+ *
+ * يُحدِّث فلتر node:type في العرض الافتراضي (display.default) ليطابق الأنواع
+ * المرتبطة في إعدادات الوحدة. عرض الصفحة (display.page) يرث بياناته من
+ * display.default، لذا لا حاجة لمزامنته بشكل منفصل.
+ *
+ * ملاحظة: التقييد الفعلي لنتائج الصفحة يبقى مفروضًا من
+ * task_manager_views_query_alter(). إذا عدّل المستخدم الـ View يدويًا،
+ * فهو مسؤول عن أي عدم تطابق (كما هو موضح في إعدادات الوحدة).
+ *
+ * @return bool
+ *   TRUE إذا تغيّر إعداد الـ View، وإلا FALSE.
+ */
+function task_manager_sync_view_types() {
+  // 1. التحقق من تفعيل Views.
+  if (!module_exists('views')) {
+    return FALSE;
+  }
+
+  // 2. تحميل إعداد الـ View.
+  $config = config('views.view.task_management');
+  if ($config->get('name') === NULL) {
+    return FALSE;
+  }
+
+  // 3. جلب الأنواع المرتبطة من الإعدادات.
+  $bundles = config_get('task_manager.settings', 'task_manager_bundles');
+  if (!is_array($bundles)) {
+    $bundles = array();
+  }
+
+  // 4. بناء مصفوفة القيم.
+  $value = array();
+  foreach ($bundles as $bundle) {
+    $value[$bundle] = $bundle;
+  }
+
+  // 5. قراءة الفلتر الحالي.
+  $current = $config->get('display.default.display_options.filters.type.value');
+
+  // 6. إذا لم يكن الفلتر موجودًا، لا نفعل شيئًا.
+  if ($current === NULL) {
+    watchdog('task_manager', 'Type filter not found in task view; skipping sync.', array(), WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  // 7. إذا كانت القيم متطابقة، لا حاجة للحفظ.
+  if ($current == $value) {
+    return FALSE;
+  }
+
+  // 8. تحديث الفلتر.
+  try {
+    $config->set('display.default.display_options.filters.type.value', $value);
+    $config->save();
+  }
+  catch (Exception $e) {
+    watchdog('task_manager', 'Failed to sync view type filter: @message', array(
+      '@message' => $e->getMessage(),
+    ), WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  // 9. مسح كاش الـ Views.
+  if (function_exists('views_invalidate_cache')) {
+    views_invalidate_cache();
+  }
+
+  // 10. تسجيل النجاح.
+  watchdog('task_manager', 'Task view type filter synced with @count bundles.', array(
+    '@count' => count($value),
+  ), WATCHDOG_INFO);
+
+  return TRUE;
+}
+
+/**
+ * مسح جميع الكاشات المتعلقة بالحقول والأنواع والقوائم.
+ */
+/**
+ * مسح الكاشات المتعلقة بالحقول والأنواع فقط.
+ *
+ * لا يستخدم backdrop_flush_all_caches() لتجنب مسح كاشات غير ضرورية.
+ */
+/**
+ * مسح الكاش بعد تعديل الإعدادات أو الحقول.
+ */
+function task_manager_clear_caches() {
+  // كاش الحقول و field info (تكفي وحدها).
+  field_cache_clear();
+
+  // كاش معلومات الكيانات.
+  entity_info_cache_clear();
+
+  // كاش أنواع المحتوى.
+  cache_clear_all('*', 'cache_bootstrap', TRUE);
+
+  // كاش الـ Views (القائمة في صفحة المهام تعتمد على View).
+  if (function_exists('views_invalidate_cache')) {
+    views_invalidate_cache();
+  }
+}
+
+
+
+/**
+ * يُطبِّق حالة المهمة بناءً على حقل حالة التعليق.
+ *
+ * يُنادى من hook_comment_insert(). يتحقق أولًا من أن التعليق منشور، ومن أن
+ * الحالة الجديدة مسموحة، ومن أن العقدة من الأنواع المرتبطة، ومن أن المستخدم
+ * (الحالي أو كاتب التعليق) يملك الصلاحية.
+ *
+ * @param object $comment
+ *   كائن التعليق المُدرج.
+ */
+function task_manager_apply_comment_status($comment) {
+  // 1. التحقق من صحة $comment.
+  if (!is_object($comment) || empty($comment->nid)) {
+    return;
+  }
+
+  // 2. لا نطبّق الحالة إلا من تعليق منشور.
+  if (isset($comment->status) && (int) $comment->status !== COMMENT_PUBLISHED) {
+    return;
+  }
+
+  // 3. قراءة الحالة المطلوبة (فارغة = بدون تغيير).
+  $items = field_get_items('comment', $comment, 'field_comment_status');
+  if (empty($items[0]['value'])) {
+    return;
+  }
+  $new_status = (string) $items[0]['value'];
+
+  // 4. القيمة ضمن الحالات المسموحة فقط.
+  $allowed = task_manager_allowed_statuses();
+  if (!is_array($allowed) || !in_array($new_status, $allowed, TRUE)) {
+    watchdog('task_manager', 'تم تجاهل حالة غير مسموحة: @status', array(
+      '@status' => $new_status,
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 5. تحميل العقدة والتأكد أنها من الأنواع المرتبطة.
+  $bundles = task_manager_get_bundles();
+  if (!is_array($bundles)) {
+    return;
+  }
+
+  // تحقق مبكر عبر node_type إن أمكن.
+  if (!empty($comment->node_type) && !in_array($comment->node_type, $bundles, TRUE)) {
+    return;
+  }
+
+  $node = node_load($comment->nid);
+  if (!$node || !in_array($node->type, $bundles, TRUE)) {
+    return;
+  }
+
+  // 6. التحقق من الصلاحيات (على المستخدم الحالي، وليس كاتب التعليق).
+  global $user;
+  if (!user_access('change task status', $user)) {
+    watchdog('task_manager', 'محاولة تغيير حالة المهمة @nid بدون صلاحية من المستخدم @uid.', array(
+      '@nid' => $node->nid,
+      '@uid' => $user->uid,
+    ), WATCHDOG_WARNING);
+    return;
+  }
+
+  // 7. لا حفظ إذا لم تتغير الحالة.
+  $langcode = field_language('node', $node, 'field_task_status');
+  if (!is_string($langcode) || $langcode === '') {
+    $langcode = LANGUAGE_NONE;
+  }
+  $current_status = !empty($node->field_task_status[$langcode][0]['value'])
+    ? (string) $node->field_task_status[$langcode][0]['value']
+    : NULL;
+  if ($current_status === $new_status) {
+    return;
+  }
+
+  // 8. تحديث حقل الحالة.
+  $node->field_task_status[$langcode][0]['value'] = $new_status;
+
+  try {
+    field_attach_update('node', $node);
+  }
+  catch (Exception $e) {
+    watchdog('task_manager', 'فشل تحديث حقل حالة المهمة @nid: @message', array(
+      '@nid' => $node->nid,
+      '@message' => $e->getMessage(),
+    ), WATCHDOG_ERROR);
+    return;
+  }
+
+  // 9. تحديث وقت التعديل (عبر Entity API لضمان التماسك).
+  $node->changed = REQUEST_TIME;
+  try {
+    node_save($node);
+  }
+  catch (Exception $e) {
+    watchdog('task_manager', 'فشل تحديث وقت تعديل المهمة @nid: @message', array(
+      '@nid' => $node->nid,
+      '@message' => $e->getMessage(),
+    ), WATCHDOG_ERROR);
+  }
+
+  // 10. مسح كاش العقدة (resetCache يكفي).
+  entity_get_controller('node')->resetCache(array($node->nid));
+
+  // 11. سجل تدقيق.
+  watchdog('task_manager', 'تغيرت حالة المهمة @nid من @old إلى @new بواسطة المستخدم @uid (تعليق @cid).', array(
+    '@nid' => $node->nid,
+    '@old' => ($current_status === NULL ? '-' : $current_status),
+    '@new' => $new_status,
+    '@uid' => (int) $user->uid,
+    '@cid' => isset($comment->cid) ? (int) $comment->cid : 0,
+  ), WATCHDOG_NOTICE);
+
+  // 12. إخطار الوحدات الفرعية (محمي).
+  try {
+    module_invoke_all('task_manager_status_changed', $node, $current_status, $new_status, $comment);
+  }
+  catch (Exception $e) {
+    watchdog('task_manager', 'فشل إخطار الوحدات الفرعية بتغير حالة المهمة: @message', array(
+      '@message' => $e->getMessage(),
+    ), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function task_manager_node_insert($node) {
+  if (!is_object($node) || empty($node->type)) {
+    return;
+  }
+  $bundles = task_manager_get_bundles();
+  if (!is_array($bundles) || !in_array($node->type, $bundles, TRUE)) {
+    return;
+  }
+  try {
+    module_invoke_all('task_manager_node_created', $node);
+  }
+  catch (Exception $e) {
+    watchdog('task_manager', 'Failed to invoke task_manager_node_created: @message', array(
+      '@message' => $e->getMessage(),
+    ), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function task_manager_node_update($node) {
+  if (!is_object($node) || empty($node->type)) {
+    return;
+  }
+  $bundles = task_manager_get_bundles();
+  if (!is_array($bundles) || !in_array($node->type, $bundles, TRUE)) {
+    return;
+  }
+  try {
+    module_invoke_all('task_manager_node_updated', $node);
+  }
+  catch (Exception $e) {
+    watchdog('task_manager', 'Failed to invoke task_manager_node_updated: @message', array(
+      '@message' => $e->getMessage(),
+    ), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * Implements hook_comment_delete().
+ */
+function task_manager_comment_delete($comment) {
+  if (!task_manager_is_task_comment($comment)) {
+    return;
+  }
+  try {
+    module_invoke_all('task_manager_comment_deleted', $comment);
+  }
+  catch (Exception $e) {
+    watchdog('task_manager', 'Failed to invoke task_manager_comment_deleted: @message', array(
+      '@message' => $e->getMessage(),
+    ), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * التأكد من تفعيل التعليقات على نوع محتوى معيّن.
+ *
+ * @param string $bundle
+ *   اسم الآلة لنوع المحتوى.
+ *
+ * @return bool
+ *   TRUE إذا كانت التعليقات مفعلة، FALSE إذا فشل التفعيل.
+ */
+function task_manager_ensure_comments_enabled($bundle) {
+  $uid = isset($GLOBALS['user']->uid) ? $GLOBALS['user']->uid : 0;
+
+  // 1. التحقق من الصلاحيات.
+  if (!user_access('administer task manager')) {
+    watchdog('task_manager', 'Unauthorized attempt to enable comments for @bundle by user @uid.', array(
+      '@bundle' => is_string($bundle) ? $bundle : gettype($bundle),
+      '@uid' => $uid,
+    ), WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  // 2. التحقق من صحة $bundle.
+  if (empty($bundle) || !is_string($bundle)) {
+    watchdog('task_manager', 'Invalid bundle type for comments: @type.', array(
+      '@type' => gettype($bundle),
+    ), WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  // 3. التحقق من تفعيل وحدة التعليقات.
+  if (!module_exists('comment')) {
+    watchdog('task_manager', 'Comment module is not enabled.', array(), WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  // 4. تحميل نوع المحتوى.
+  $node_type = node_type_load($bundle);
+  if (!$node_type) {
+    watchdog('task_manager', 'Bundle does not exist: @bundle.', array(
+      '@bundle' => $bundle,
+    ), WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  // 5. التأكد من وجود حقل التعليق الأساسي؛ فظهور الحزمة في Field API
+  //    لا يضمن وجود instance فعلي لحقل comment_body.
+  if (!task_manager_ensure_comment_bundle($bundle)) {
+    watchdog('task_manager', 'Failed to ensure comment body field for @bundle.', array(
+      '@bundle' => $bundle,
+    ), WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  // 6. تفعيل إعدادات التعليقات في كائن نوع المحتوى (الطريقة الصحيحة).
+  //    نعيد تحميل النوع لضمان حصولنا على أحدث البيانات.
+  $node_type = node_type_load($bundle);
+  if (empty($node_type->settings['comment_enabled'])) {
+    try {
+      $node_type->settings['comment_enabled'] = TRUE;
+      // قيمة Backdrop الافتراضية للتعليقات المغلقة غير فارغة.
+      $node_type->settings['comment_default'] = COMMENT_NODE_OPEN;
+      node_type_save($node_type);
+    }
+    catch (Exception $e) {
+      watchdog('task_manager', 'Failed to enable comment settings for @bundle: @message', array(
+        '@bundle' => $bundle,
+        '@message' => $e->getMessage(),
+      ), WATCHDOG_ERROR);
+      return FALSE;
+    }
+  }
+
+  // node_type_save() و task_manager_ensure_comment_bundle() يمسحان الكاش عند
+  // تغيير البيانات؛ تجنب مسح الكاش مجددًا في المسار الذي لا يتطلب أي تغيير.
+
+  // 7. التحقق النهائي.
+  $node_type = node_type_load($bundle);
+  $comment_bundle = 'comment_node_' . $bundle;
+  $comment_body_instance = field_info_instance('comment', 'comment_body', $comment_bundle);
+  if (!$node_type || empty($node_type->settings['comment_enabled']) || !is_array($comment_body_instance)) {
+    watchdog('task_manager', 'Comments were not fully enabled for @bundle.', array(
+      '@bundle' => $bundle,
+    ), WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  // 8. تسجيل النجاح.
+  watchdog('task_manager', 'Comments enabled for @bundle by user @uid.', array(
+    '@bundle' => $bundle,
+    '@uid' => $uid,
+  ), WATCHDOG_INFO);
+
+  return TRUE;
+}
+
+/**
+ * التأكد من وجود حقل نص التعليق وحزمتِه لنوع المحتوى.
+ *
+ * لا يعتمد على وجود الحزمة في قائمة Field API وحدها، إذ قد تكون معرفة
+ * ديناميكيًا دون instance فعلي لحقل comment_body.
+ *
+ * @param string $bundle
+ *   اسم الآلة لنوع المحتوى.
+ *
+ * @return string|FALSE
+ *   اسم حزمة التعليقات إذا نجح الإنشاء، أو FALSE عند الفشل.
+ */
+function task_manager_ensure_comment_bundle($bundle) {
+  // معرفة المستخدم الحالي (آمن في سياقات CLI).
+  $uid = isset($GLOBALS['user']->uid) ? $GLOBALS['user']->uid : 0;
+
+  // 1. التحقق من الصلاحيات.
+  if (!user_access('administer task manager')) {
+    watchdog('task_manager', 'Unauthorized attempt to ensure comment bundle for @bundle by user @uid.', array(
+      '@bundle' => is_string($bundle) ? $bundle : gettype($bundle),
+      '@uid' => $uid,
+    ), WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  // 2. التحقق من صحة $bundle.
+  if (empty($bundle) || !is_string($bundle)) {
+    watchdog('task_manager', 'Invalid bundle type for comment bundle: @type.', array(
+      '@type' => gettype($bundle),
+    ), WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  // 3. بناء اسم حزمة التعليقات.
+  $comment_bundle = 'comment_node_' . $bundle;
+
+  // 4. التحقق من وجود النوع.
+  $node_type = node_type_load($bundle);
+  if (!$node_type) {
+    watchdog('task_manager', 'Node type does not exist: @bundle.', array(
+      '@bundle' => $bundle,
+    ), WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  // 5. لا يكفي وجود الحزمة؛ يجب أن يكون حقل نص التعليق مربوطًا بها فعليًا.
+  if (field_read_instance('comment', 'comment_body', $comment_bundle) !== FALSE) {
+    return $comment_bundle;
+  }
+
+  // 6. إنشاء الحزمة وحقل التعليق الأساسي.
+  try {
+    if (function_exists('_comment_body_field_create')) {
+      // دالة داخلية في Backdrop، قد تتغير في إصدارات مستقبلية.
+      _comment_body_field_create($node_type);
+    }
+    else {
+      // احتياطي: إنشاء الحزمة يدويًا.
+      field_attach_create_bundle('comment', $comment_bundle);
+    }
+  }
+  catch (Exception $e) {
+    watchdog('task_manager', 'Failed to create comment bundle for @bundle: @message', array(
+      '@bundle' => $bundle,
+      '@message' => $e->getMessage(),
+    ), WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  // 7. إعادة بناء الكاش والتحقق من إنشاء حقل التعليق الأساسي.
+  entity_info_cache_clear();
+  field_cache_clear();
+
+  if (field_read_instance('comment', 'comment_body', $comment_bundle) === FALSE) {
+    watchdog('task_manager', 'Comment body field was not created for @bundle.', array(
+      '@bundle' => $bundle,
+    ), WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  // 9. تسجيل النجاح.
+  watchdog('task_manager', 'Comment body field ensured for @bundle by user @uid.', array(
+    '@bundle' => $bundle,
+    '@uid' => $uid,
+  ), WATCHDOG_INFO);
+
+  return $comment_bundle;
+}
+
+/**
+ * Implements hook_theme().
+ *
+ * يُعرِّف قوالب الثيم الخاصة بوحدة إدارة المهام.
+ */
+function task_manager_theme($existing, $type, $theme, $path) {
+  return array(
+    'node__task_manager' => array(
+      'template' => 'node--task-manager',
+      'path' => $path . '/templates',
+      'base hook' => 'node',
+      'variables' => array(
+        'node' => NULL,
+        'view_mode' => 'full',
+      ),
+    ),
+    'comment__task_manager' => array(
+      'template' => 'comment--task-manager',
+      'path' => $path . '/templates',
+      'base hook' => 'comment',
+      'variables' => array(
+        'comment' => NULL,
+        'node' => NULL,
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements hook_preprocess_node().
+ *
+ * يضيف اقتراح قالب مخصص لجميع أنواع المحتوى المرتبطة بالوحدة.
+ */
+function task_manager_preprocess_node(&$variables) {
+  // 1. التحقق من وجود $bundles.
+  $bundles = task_manager_get_bundles();
+  if (!is_array($bundles) || empty($bundles)) {
+    return;
+  }
+
+  // 2. تحديد نوع المحتوى (من node إن أمكن).
+  $type = !empty($variables['node']->type) ? $variables['node']->type : (!empty($variables['type']) ? $variables['type'] : NULL);
+  if (empty($type) || !in_array($type, $bundles, TRUE)) {
+    return;
+  }
+
+  // 3. إضافة اقتراح القالب.
+  if (!isset($variables['theme_hook_suggestions'])) {
+    $variables['theme_hook_suggestions'] = array();
+  }
+  $variables['theme_hook_suggestions'][] = 'node__task_manager';
+
+  // 4. إضافة CSS مرة واحدة فقط.
+  static $css_added = FALSE;
+  if (!$css_added) {
+    $module_path = backdrop_get_path('module', 'task_manager');
+    if ($module_path) {
+      backdrop_add_css($module_path . '/css/task-manager.css');
+    }
+    $css_added = TRUE;
+  }
+}
+/**
+ * Implements hook_preprocess_comment().
+ *
+ * يضيف اقتراح قالب مخصص للتعليقات على أنواع المحتوى المرتبطة بالوحدة.
+ */
+function task_manager_preprocess_comment(&$variables) {
+  // 1. جلب أنواع المحتوى المرتبطة.
+  $bundles = task_manager_get_bundles();
+  if (!is_array($bundles) || empty($bundles)) {
+    return;
+  }
+
+  // 2. التحقق من وجود العقدة.
+  if (empty($variables['node']) || empty($variables['node']->type)) {
+    return;
+  }
+
+  // 3. التحقق من أن التعليق على نوع محتوى مرتبط.
+  if (!in_array($variables['node']->type, $bundles, TRUE)) {
+    return;
+  }
+
+  // 4. إضافة اقتراح القالب.
+  if (!isset($variables['theme_hook_suggestions'])) {
+    $variables['theme_hook_suggestions'] = array();
+  }
+  $variables['theme_hook_suggestions'][] = 'comment__task_manager';
+}
+/**
+ * Implements hook_views_api().
+ */
+function task_manager_views_api() {
+  return array(
+    'api' => 3.0,
+    'path' => backdrop_get_path('module', 'task_manager'),
+  );
+}
+/**
+ * Implements hook_views_query_alter().
+ *
+ * يقيّد الـ View بأنواع المحتوى المرتبطة. إذا لم يوجد أي نوع مرتبط،
+ * لا تُعرض أي نتائج (بدل عرض كل المحتوى).
+ *
+ * @param object $view
+ *   كائن الـ View.
+ * @param object $query
+ *   كائن الاستعلام.
+ */
+function task_manager_views_query_alter(&$view, &$query) {
+  // 1. التحقق من أن الـ View هو task_management.
+  if (!is_object($view) || empty($view->name) || $view->name !== 'task_management') {
+    return;
+  }
+
+  // 2. التحقق من أن $query كائن.
+  if (!is_object($query)) {
+    return;
+  }
+
+  // 3. جلب الأنواع المرتبطة.
+  $bundles = task_manager_get_bundles();
+
+  // 4. إذا لم توجد أنواع مرتبطة، لا تُعرض أي نتائج.
+  if (!is_array($bundles) || empty($bundles)) {
+    $query->add_where_expression(0, '1 = 0');
+    return;
+  }
+
+  // 5. تصفية القيم النصية فقط.
+  $bundles = array_filter($bundles, 'is_string');
+  if (empty($bundles)) {
+    $query->add_where_expression(0, '1 = 0');
+    return;
+  }
+
+  // 6. تقييد الاستعلام بالأنواع المرتبطة.
+  $query->add_where(0, 'node.type', array_values($bundles), 'IN');
+}
+
+/* ============================================================
+ *  الأمان والعرض: صلاحيات الحقول ونموذج التعليق ودوال العرض
+ * ============================================================ */
+
+/**
+ * Implements hook_field_access().
+ *
+ * - field_employee_name: تعديله للمسؤولين فقط (منع انتحال أسماء الموظفين).
+ * - field_comment_status: تعديله لمن يملك صلاحية change task status.
+ *
+ * @param string $op
+ *   العملية (view, edit, ...).
+ * @param array $field
+ *   تعريف الحقل.
+ * @param string $entity_type
+ *   نوع الكيان (node, user, comment, ...).
+ * @param object $entity
+ *   كائن الكيان.
+ * @param object $account
+ *   كائن المستخدم.
+ *
+ * @return bool|NULL
+ *   TRUE للسماح، FALSE للمنع، NULL لعدم التدخل.
+ */
+function task_manager_field_access($op, $field, $entity_type, $entity, $account) {
+  // 1. التحقق من صحة المدخلات.
+  if (empty($field['field_name']) || !is_object($account)) {
+    return NULL;
+  }
+
+  // 2. التحقق من العملية (نحن نهتم بـ edit فقط).
+  if ($op !== 'edit') {
+    return NULL;
+  }
+
+  // 3. التحقق من الحقل والكيان.
+  switch ($field['field_name']) {
+    case 'field_employee_name':
+      if ($entity_type !== 'user') {
+        return NULL;
+      }
+      return user_access('edit employee names', $account);
+
+    case 'field_comment_status':
+      if ($entity_type !== 'comment') {
+        return NULL;
+      }
+      return user_access('change task status', $account);
+  }
+
+  // 4. لا نتدخل في الحقول الأخرى.
+  return NULL;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for comment_form.
+ *
+ * يربط حقل حالة التعليق بحالة المهمة الحالية.
+ *
+ * @param array $form
+ *   مصفوفة النموذج.
+ * @param array $form_state
+ *   حالة النموذج.
+ */
+function task_manager_form_comment_form_alter(&$form, &$form_state) {
+  // 1. التحقق من وجود العقدة وأنها من الأنواع المرتبطة.
+  $bundles = task_manager_get_bundles();
+  if (!is_array($bundles) || empty($bundles) || empty($form['#node']) || empty($form['#node']->type)) {
+    return;
+  }
+  if (!in_array($form['#node']->type, $bundles, TRUE)) {
+    return;
+  }
+
+  // 2. التحقق من وجود حقل حالة التعليق.
+  if (!isset($form['field_comment_status'])) {
+    return;
+  }
+
+  // 3. التحقق من الصلاحية.
+  if (!user_access('change task status')) {
+    $form['field_comment_status']['#access'] = FALSE;
+    return;
+  }
+
+  // 4. عند تعديل تعليق قديم، نترك القيمة المحفوظة كما هي.
+  if (!empty($form['cid']['#value'])) {
+    return;
+  }
+
+  // 5. تحديد اللغة.
+  $lang = isset($form['field_comment_status']['#language']) ? $form['field_comment_status']['#language'] : LANGUAGE_NONE;
+  if (!isset($form['field_comment_status'][$lang])) {
+    return;
+  }
+
+  // 6. جلب حالة المهمة الحالية.
+  $items = field_get_items('node', $form['#node'], 'field_task_status');
+  if (!is_array($items) || empty($items[0]['value'])) {
+    return;
+  }
+  $current = (string) $items[0]['value'];
+  if ($current === '') {
+    return;
+  }
+
+  // 7. بناء الخيارات (مع خيار "بدون تغيير" في البداية).
+  $options = array('' => t('- بدون تغيير -')) + task_manager_status_labels('field_task_status');
+
+  // 8. ضبط القيمة الافتراضية والخيارات والوصف.
+  $form['field_comment_status'][$lang]['#default_value'] = array($current);
+  $form['field_comment_status'][$lang]['#options'] = $options;
+  $form['field_comment_status'][$lang]['#description'] = t('الحالة الحالية للمهمة محددة مسبقًا. غيّرها لتحديث حالة المهمة عند حفظ التعليق، أو اتركها كما هي لعدم التغيير.');
+}
+
+/**
+ * يُرجع تسميات قيم حقل قائمة (مفتاح => تسمية) مع تخزين مؤقت خلال الطلب.
+ *
+ * تُستبعد القيم الفارغة (مثل خيار "بدون تغيير") من النتيجة.
+ *
+ * @param string $field_name
+ *   اسم حقل من نوع List (text).
+ *
+ * @return array
+ *   مصفوفة (مفتاح => تسمية مترجمة).
+ */
+function task_manager_status_labels($field_name = 'field_task_status') {
+  $labels = &backdrop_static(__FUNCTION__, array());
+
+  if (!isset($labels[$field_name])) {
+    $labels[$field_name] = array();
+
+    // التحقق من وجود الحقل.
+    $field = field_info_field($field_name);
+    if (!is_array($field) || empty($field['type'])) {
+      return $labels[$field_name];
+    }
+
+    // التحقق من أن الحقل من نوع List.
+    if ($field['type'] !== 'list_text' && $field['type'] !== 'list_integer' && $field['type'] !== 'list_float') {
+      return $labels[$field_name];
+    }
+
+    // جلب القيم المسموحة.
+    $allowed = list_allowed_values($field);
+    if (!is_array($allowed)) {
+      return $labels[$field_name];
+    }
+
+    // بناء التسميات (استبعاد المفتاح الفارغ).
+    foreach ($allowed as $key => $label) {
+      if ((string) $key !== '') {
+        $labels[$field_name][$key] = $label;
+      }
+    }
+  }
+
+  return $labels[$field_name];
+}
+
+/**
+ * يُرجع اسم العرض لمستخدم: اسم الموظف (اسم الحساب) أو اسم الحساب فقط.
+ *
+ * النتيجة نص خام يجب تهريبه بـ check_plain() عند الطباعة. تُخزَّن النتائج
+ * خلال الطلب لتفادي تكرار user_load().
+ *
+ * @param int $uid
+ *   معرف المستخدم.
+ *
+ * @return string
+ *   اسم العرض (خام، يتطلب تهريبًا).
+ */
+function task_manager_display_name($uid) {
+  $names = &backdrop_static(__FUNCTION__, array());
+
+  // التحقق من صحة $uid.
+  if (!is_numeric($uid)) {
+    return '';
+  }
+  $uid = (int) $uid;
+
+  if (!isset($names[$uid])) {
+    // المستخدم المجهول.
+    if ($uid === 0) {
+      $names[$uid] = '';
+      return $names[$uid];
+    }
+
+    $account = user_load($uid);
+    if (!$account) {
+      $names[$uid] = '';
+      return $names[$uid];
+    }
+
+    // جلب اسم الموظف (إن وُجد).
+    $employee_name = '';
+    $items = field_get_items('user', $account, 'field_employee_name');
+    if (is_array($items) && !empty($items[0]['value'])) {
+      $employee_name = (string) $items[0]['value'];
+    }
+
+    // اسم الحساب.
+    $account_name = !empty($account->name) ? (string) $account->name : '';
+
+    // بناء اسم العرض.
+    if ($employee_name !== '' && $account_name !== '') {
+      $names[$uid] = $employee_name . ' (' . $account_name . ')';
+    }
+    elseif ($employee_name !== '') {
+      $names[$uid] = $employee_name;
+    }
+    else {
+      $names[$uid] = $account_name;
+    }
+  }
+
+  return $names[$uid];
+}

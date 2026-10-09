@@ -1,0 +1,560 @@
+<?php
+/**
+ * @file
+ * وحدة التنبيهات لوحدة Task Manager.
+ *
+ * تستمع لأحداث Task Manager وتُرسل تنبيهات داخل الموقع.
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function task_manager_notifications_permission() {
+  return array(
+    'administer task manager notifications' => array(
+      'title' => t('إدارة إعدادات تنبيهات المهام'),
+      'description' => t('الوصول إلى إعدادات وحدة التنبيهات.'),
+      'restrict access' => TRUE,
+    ),
+    'receive task notifications' => array(
+      'title' => t('استقبال تنبيهات المهام'),
+      'description' => t('استقبال تنبيهات عند إضافة تعليقات على المهام.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+/**
+ * Implements hook_menu().
+ */
+function task_manager_notifications_menu() {
+  $items = array();
+
+  // صفحة التنبيهات (تبويب في My Account).
+  $items['user/%user/notifications'] = array(
+    'title' => 'التنبيهات',
+    'page callback' => 'task_manager_notifications_page',
+    'page arguments' => array(1),
+    'title callback' => 'task_manager_notifications_tab_title',
+    'access callback' => 'task_manager_notifications_access',
+    'access arguments' => array(1),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 10,
+  );
+
+  // مسار مختصر (يعيد التوجيه إلى صفحة المستخدم الحالي).
+  $items['user/notifications'] = array(
+    'title' => 'التنبيهات',
+    'page callback' => 'task_manager_notifications_redirect',
+    'access arguments' => array('receive task notifications'),
+    'type' => MENU_CALLBACK,
+  );
+
+  // مسار لتحديث التنبيهات عبر AJAX.
+  $items['user/notifications/count'] = array(
+    'title' => 'عدد التنبيهات',
+    'page callback' => 'task_manager_notifications_count_json',
+    'access arguments' => array('receive task notifications'),
+    'type' => MENU_CALLBACK,
+  );
+
+  // صفحة الإعدادات.
+  $items['admin/config/task-manager/notifications'] = array(
+    'title' => 'إعدادات التنبيهات',
+    'description' => 'تكوين تنبيهات المهام.',
+    'page callback' => 'backdrop_get_form',
+    'page arguments' => array('task_manager_notifications_settings_form'),
+    'access arguments' => array('administer task manager notifications'),
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  return $items;
+}
+
+/**
+ * دالة الوصول لصفحة تنبيهات المستخدم.
+ */
+function task_manager_notifications_access($account) {
+  global $user;
+
+  // المستخدم يمكنه رؤية تنبيهاته فقط.
+  if ($user->uid == $account->uid) {
+    return user_access('receive task notifications');
+  }
+
+  // المسؤولون يمكنهم رؤية تنبيهات أي مستخدم.
+  return user_access('administer task manager notifications');
+}
+
+/**
+ * إعادة التوجيه إلى صفحة تنبيهات المستخدم الحالي.
+ */
+function task_manager_notifications_redirect() {
+  global $user;
+  backdrop_goto('user/' . $user->uid . '/notifications');
+}
+
+/**
+ * عنوان تبويب التنبيهات (يُحسب عند العرض لكل مستخدم).
+ *
+ * بديل عن hook_menu_alter() الذي كان يخزّن عدد مستخدم واحد في جدول القوائم.
+ */
+function task_manager_notifications_tab_title($account = NULL) {
+  global $user;
+
+  $title = t('التنبيهات');
+  if ($user->uid && is_object($account) && $account->uid == $user->uid) {
+    $count = task_manager_notifications_get_unread_count($user->uid);
+    if ($count > 0) {
+      $title = t('التنبيهات (@count)', array('@count' => $count));
+    }
+  }
+  return $title;
+}
+
+/**
+ * Implements hook_page_build().
+ *
+ * إضافة أيقونة التنبيهات إلى الصفحة.
+ *
+ * تُحمّل ملفات CSS و JS هنا فقط للمستخدمين المصرّح لهم، بدلاً من تحميلها
+ * في كل صفحة لكل الزوار عبر hook_init().
+ */
+function task_manager_notifications_page_build(&$page) {
+  global $user;
+
+  // التحقق من صلاحية المستخدم.
+  if (!$user->uid || !user_access('receive task notifications', $user)) {
+    return;
+  }
+
+  $module_path = backdrop_get_path('module', 'task_manager_notifications');
+  backdrop_add_css($module_path . '/css/task-manager-notifications.css');
+  backdrop_add_js($module_path . '/js/task-manager-notifications.js');
+  backdrop_add_js(array(
+    'taskManagerNotifications' => array(
+      // url() تتضمن المسار الأساسي (base path) مسبقاً.
+      'countUrl' => url('user/notifications/count'),
+      'interval' => 120000,
+    ),
+  ), 'setting');
+
+  // جلب عدد التنبيهات غير المقروءة.
+  $count = task_manager_notifications_get_unread_count($user->uid);
+
+  // بناء الأيقونة.
+  $page['notification_bell'] = array(
+    '#type' => 'container',
+    '#attributes' => array(
+      'class' => array('task-notification-bell'),
+      'id' => 'task-notification-bell',
+    ),
+    '#weight' => -100,
+    'link' => array(
+      '#type' => 'link',
+      '#title' => '<span class="bell-icon">🔔</span>' .
+        ($count > 0 ? '<span class="bell-badge">' . $count . '</span>' : ''),
+      '#href' => 'user/notifications',
+      '#options' => array(
+        'html' => TRUE,
+        'attributes' => array(
+          'class' => array('notification-link'),
+          'title' => t('التنبيهات'),
+        ),
+      ),
+    ),
+  );
+}
+
+/**
+ * نموذج إعدادات التنبيهات.
+ */
+function task_manager_notifications_settings_form($form, &$form_state) {
+  $form['intro'] = array(
+    '#markup' => '<p>' . t('اختر متى ومن يستقبل التنبيهات عند إضافة تعليق على مهمة.') . '</p>',
+  );
+
+  $form['notify_assignee'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('إرسال تنبيه لصاحب المهمة (منشئها)'),
+    '#default_value' => config_get('task_manager_notifications.settings', 'notify_assignee'),
+  );
+
+  $form['notify_last_replier'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('إرسال تنبيه لآخر من ردّ على المهمة'),
+    '#default_value' => config_get('task_manager_notifications.settings', 'notify_last_replier'),
+  );
+
+  $form['notify_admins'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('إرسال تنبيه للمسؤولين'),
+    '#default_value' => config_get('task_manager_notifications.settings', 'notify_admins'),
+  );
+
+  $form['skip_self'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('عدم إرسال تنبيه لمن أضاف التعليق نفسه'),
+    '#default_value' => config_get('task_manager_notifications.settings', 'skip_self', TRUE),
+  );
+
+  $form['use_queue'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('استخدام Queue لإرسال التنبيهات (أفضل للأداء)'),
+    '#description' => t('إذا فُعّل، تُرسل التنبيهات عبر Cron بدلاً من الطلب الحالي.'),
+    '#default_value' => config_get('task_manager_notifications.settings', 'use_queue'),
+  );
+
+  return system_settings_form($form);
+}
+
+/**
+ * Implements hook_task_manager_comment_added().
+ *
+ * نقطة الاتصال الرئيسية: تُستدعى عند إضافة تعليق جديد.
+ */
+function task_manager_notifications_task_manager_comment_added($comment) {
+  // التحقق من الإعدادات.
+  $notify_assignee = config_get('task_manager_notifications.settings', 'notify_assignee');
+  $notify_last_replier = config_get('task_manager_notifications.settings', 'notify_last_replier');
+  $notify_admins = config_get('task_manager_notifications.settings', 'notify_admins');
+  $skip_self = config_get('task_manager_notifications.settings', 'skip_self', TRUE);
+  $use_queue = config_get('task_manager_notifications.settings', 'use_queue');
+
+  // إذا لم يُفعّل أي خيار، لا نفعل شيئًا.
+  if (!$notify_assignee && !$notify_last_replier && !$notify_admins) {
+    return;
+  }
+
+  // تحميل العقدة.
+  $node = node_load($comment->nid);
+  if (!$node) {
+    return;
+  }
+
+  // جمع المستخدمين المستهدفين.
+  $recipients = array();
+
+  // 1. صاحب المهمة (منشئها).
+  if ($notify_assignee && !empty($node->uid)) {
+    $recipients[$node->uid] = $node->uid;
+  }
+
+  // 2. آخر من ردّ (إذا كان مختلفًا عن صاحب المهمة).
+  if ($notify_last_replier) {
+    $last_replier = task_manager_notifications_get_last_replier($node);
+    if ($last_replier) {
+      $recipients[$last_replier] = $last_replier;
+    }
+  }
+
+  // 3. المسؤولون.
+  if ($notify_admins) {
+    $admin_uids = task_manager_notifications_get_admin_uids();
+    foreach ($admin_uids as $uid) {
+      $recipients[$uid] = $uid;
+    }
+  }
+
+  // إزالة من أضاف التعليق نفسه.
+  if ($skip_self && !empty($comment->uid)) {
+    unset($recipients[$comment->uid]);
+  }
+
+  if (empty($recipients)) {
+    return;
+  }
+
+  // إرسال التنبيهات.
+  if ($use_queue) {
+    $queue = BackdropQueue::get('task_manager_notifications');
+    foreach ($recipients as $uid) {
+      $queue->createItem(array(
+        'uid' => $uid,
+        'nid' => $node->nid,
+        'cid' => $comment->cid,
+      ));
+    }
+  }
+  else {
+    foreach ($recipients as $uid) {
+      task_manager_notifications_send($uid, $node, $comment);
+    }
+  }
+}
+
+/**
+ * الحصول على آخر من ردّ على المهمة.
+ *
+ * @param object $node
+ *   كائن العقدة.
+ *
+ * @return int|FALSE
+ *   معرّف المستخدم، أو FALSE إذا لم يوجد.
+ */
+function task_manager_notifications_get_last_replier($node) {
+  $query = db_query(
+    "SELECT uid FROM {comment} WHERE nid = :nid AND status = 1 ORDER BY created DESC LIMIT 1 OFFSET 1",
+    array(':nid' => $node->nid)
+  );
+  $uid = $query->fetchField();
+  return $uid ? $uid : FALSE;
+}
+
+/**
+ * الحصول على معرّفات المسؤولين.
+ *
+ * @return array
+ *   مصفوفة بمعرّفات المستخدمين.
+ */
+function task_manager_notifications_get_admin_uids() {
+  $uids = &backdrop_static(__FUNCTION__);
+  if (isset($uids)) {
+    return $uids;
+  }
+
+  // الصلاحيات في Backdrop مخزّنة في إعدادات الأدوار (لا يوجد جدول role_permission).
+  $roles = array_keys(user_roles(TRUE, 'administer task manager notifications'));
+  if (empty($roles)) {
+    $uids = array();
+  }
+  elseif (in_array(BACKDROP_AUTHENTICATED_ROLE, $roles)) {
+    // دور "المستخدم المسجل" غير مخزّن في users_roles، فكل المستخدمين النشطين معنيّون.
+    $uids = db_query('SELECT uid FROM {users} WHERE uid > 0 AND status = 1')->fetchCol();
+  }
+  else {
+    $uids = db_query(
+      'SELECT DISTINCT u.uid FROM {users} u INNER JOIN {users_roles} ur ON ur.uid = u.uid WHERE ur.role IN (:roles) AND u.status = 1',
+      array(':roles' => $roles)
+    )->fetchCol();
+  }
+
+  return $uids;
+}
+
+/**
+ * إرسال تنبيه لمستخدم معين.
+ *
+ * @param int $uid
+ *   معرّف المستخدم.
+ * @param object $node
+ *   كائن العقدة.
+ * @param object $comment
+ *   كائن التعليق.
+ */
+function task_manager_notifications_send($uid, $node, $comment) {
+  $user = user_load($uid);
+  if (!$user) {
+    return;
+  }
+
+  // التحقق من الصلاحية.
+  if (!user_access('receive task notifications', $user)) {
+    return;
+  }
+
+  // التحقق من عدم وجود تنبيه سابق لنفس التعليق.
+  $exists = db_query(
+    "SELECT 1 FROM {task_manager_notifications} WHERE uid = :uid AND cid = :cid",
+    array(':uid' => $uid, ':cid' => $comment->cid)
+  )->fetchField();
+
+  if ($exists) {
+    return;
+  }
+
+  // حفظ التنبيه في قاعدة البيانات.
+  // db_merge تتجنب خطأ المفتاح المكرّر إذا وصل طلبان متزامنان لنفس التعليق.
+  db_merge('task_manager_notifications')
+    ->key(array(
+      'nid' => $node->nid,
+      'cid' => $comment->cid,
+      'uid' => $uid,
+    ))
+    ->insertFields(array(
+      'nid' => $node->nid,
+      'cid' => $comment->cid,
+      'uid' => $uid,
+      'created' => REQUEST_TIME,
+      'status' => 0,
+    ))
+    ->execute();
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * حذف التنبيهات المقروءة القديمة لمنع نمو الجدول بلا حدود.
+ */
+function task_manager_notifications_cron() {
+  $retention_days = 90;
+  db_delete('task_manager_notifications')
+    ->condition('status', 1)
+    ->condition('created', REQUEST_TIME - ($retention_days * 86400), '<')
+    ->execute();
+}
+
+/**
+ * Implements hook_cron_queue_info().
+ */
+function task_manager_notifications_cron_queue_info() {
+  $queues['task_manager_notifications'] = array(
+    'worker callback' => 'task_manager_notifications_queue_worker',
+    'time' => 60,
+  );
+  return $queues;
+}
+
+/**
+ * Worker callback لمعالجة Queue.
+ */
+function task_manager_notifications_queue_worker($item) {
+  $node = node_load($item['nid']);
+  $comment = comment_load($item['cid']);
+  if ($node && $comment) {
+    task_manager_notifications_send($item['uid'], $node, $comment);
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function task_manager_notifications_theme() {
+  return array(
+    'task_manager_notification' => array(
+      'variables' => array('notification' => NULL, 'node' => NULL),
+      'template' => 'task-manager-notification',
+      'path' => backdrop_get_path('module', 'task_manager_notifications') . '/templates',
+    ),
+  );
+}
+
+/**
+ * صفحة عرض التنبيهات.
+ *
+ * @param object $account
+ *   كائن المستخدم.
+ */
+function task_manager_notifications_page($account = NULL) {
+  global $user;
+
+  // إذا لم يُمرَّر حساب، استخدم المستخدم الحالي.
+  if (!$account) {
+    $account = $user;
+  }
+
+  // تحميل أنماط الصفحة (قد لا تكون محمّلة إذا كان المدير يعرض تنبيهات غيره).
+  backdrop_add_css(backdrop_get_path('module', 'task_manager_notifications') . '/css/task-manager-notifications.css');
+
+  // تحديد التنبيهات كمقروءة (فقط لصاحب الحساب).
+  if ($user->uid == $account->uid) {
+    db_update('task_manager_notifications')
+      ->fields(array('status' => 1))
+      ->condition('uid', $account->uid)
+      ->condition('status', 0)
+      ->execute();
+    // إعادة تهيئة العداد المخزّن حتى يظهر الصفر في نفس الطلب.
+    backdrop_static_reset('task_manager_notifications_get_unread_count');
+  }
+
+  // جلب التنبيهات.
+  $query = db_select('task_manager_notifications', 'n')
+    ->fields('n')
+    ->condition('uid', $account->uid)
+    ->orderBy('created', 'DESC')
+    ->extend('PagerDefault')
+    ->limit(20);
+
+  $notifications = $query->execute()->fetchAll();
+
+  $build = array();
+
+  if (empty($notifications)) {
+    $build['empty'] = array(
+      '#markup' => '<div class="task-notifications-empty">' .
+        '<p>' . t('لا توجد تنبيهات حالياً.') . '</p>' .
+        '</div>',
+    );
+    return $build;
+  }
+
+  $build['header'] = array(
+    '#markup' => '<div class="task-notifications-header">' .
+      '<h2>' . t('التنبيهات') . '</h2>' .
+      '<span class="task-notifications-count">' .
+      format_plural(count($notifications), 'تنبيه واحد', '@count تنبيهات') .
+      '</span>' .
+      '</div>',
+  );
+
+  $build['list'] = array(
+    '#type' => 'container',
+    '#attributes' => array('class' => array('task-notifications-list')),
+  );
+
+  // تحميل كل العقد دفعة واحدة بدل استعلام لكل تنبيه.
+  $nids = array();
+  foreach ($notifications as $notification) {
+    $nids[$notification->nid] = $notification->nid;
+  }
+  $nodes = node_load_multiple($nids);
+
+  foreach ($notifications as $notification) {
+    $node = isset($nodes[$notification->nid]) ? $nodes[$notification->nid] : FALSE;
+    // لا تُعرض عناوين مهام لا يملك المستخدم الحالي صلاحية عرضها.
+    if ($node && !node_access('view', $node)) {
+      $node = FALSE;
+    }
+    $build['list'][] = array(
+      '#theme' => 'task_manager_notification',
+      '#notification' => $notification,
+      '#node' => $node,
+    );
+  }
+
+  $build['pager'] = array('#theme' => 'pager');
+
+  return $build;
+}
+
+/**
+ * إرجاع عدد التنبيهات غير المقروءة بصيغة JSON.
+ */
+function task_manager_notifications_count_json() {
+  global $user;
+
+  $count = task_manager_notifications_get_unread_count($user->uid);
+
+  $response = array(
+    'count' => $count,
+  );
+
+  backdrop_json_output($response);
+  backdrop_exit();
+}
+
+/**
+ * جلب عدد التنبيهات غير المقروءة.
+ *
+ * @param int $uid
+ *   معرّف المستخدم.
+ *
+ * @return int
+ *   عدد التنبيهات غير المقروءة.
+ */
+function task_manager_notifications_get_unread_count($uid) {
+  // تخزين مؤقت للنتيجة خلال الطلب، مفهرس حسب المستخدم.
+  // ملاحظة: الوسيط الثاني لـ backdrop_static هو القيمة الافتراضية وليس مفتاحاً.
+  $counts = &backdrop_static(__FUNCTION__, array());
+  if (!isset($counts[$uid])) {
+    $counts[$uid] = (int) db_query(
+      "SELECT COUNT(*) FROM {task_manager_notifications} WHERE uid = :uid AND status = 0",
+      array(':uid' => $uid)
+    )->fetchField();
+  }
+
+  return $counts[$uid];
+}
+
