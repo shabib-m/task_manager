@@ -1,8 +1,0 @@
-{
-    "_config_name": "task_manager_notifications.settings",
-    "notify_assignee": true,
-    "notify_last_replier": false,
-    "notify_admins": false,
-    "skip_self": true,
-    "use_queue": false
-}
